@@ -5,6 +5,8 @@
 //! unprivileged daemon via SCM_RIGHTS.
 
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 
 use eoip_proto::EoipError;
 

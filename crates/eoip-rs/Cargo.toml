@@ -31,3 +31,4 @@ clap = { workspace = true }
 thiserror = { workspace = true }
 crossbeam = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
+libc = "0.2"
