@@ -200,27 +200,20 @@ async fn run(args: Args) -> Result<(), DaemonError> {
                 tx_sender.clone(), tunnel_cancel.clone(),
             );
 
-            // TAP writer (raw socket → TAP)
+            // TAP writer — dedicated OS thread for zero-overhead channel → TAP delivery
             if let Some(ref rx_recv) = handle.rx_receiver {
-                let tap_w = Arc::clone(tap);
+                let tap_fd = tap.as_fd().as_raw_fd();
                 let rx = rx_recv.clone();
-                let cancel = tunnel_cancel.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            result = tokio::task::spawn_blocking({
-                                let rx = rx.clone();
-                                move || rx.recv()
-                            }) => {
-                                match result {
-                                    Ok(Ok(buf)) => { let _ = tap_w.write(buf.as_slice()).await; }
-                                    _ => break,
-                                }
-                            }
+                let tid = *tunnel_id;
+                std::thread::Builder::new()
+                    .name(format!("tap-wr-{tid}"))
+                    .spawn(move || {
+                        while let Ok(buf) = rx.recv() {
+                            let data = buf.as_slice();
+                            unsafe { libc::write(tap_fd, data.as_ptr() as *const _, data.len()) };
                         }
-                    }
-                });
+                    })
+                    .expect("failed to spawn TAP writer thread");
             }
 
             // Keepalive

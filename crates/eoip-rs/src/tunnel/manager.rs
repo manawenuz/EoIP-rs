@@ -168,31 +168,19 @@ impl TunnelManager {
             tunnel_cancel.clone(),
         );
 
-        // Spawn TAP writer (raw socket → TAP)
+        // TAP writer — dedicated OS thread for zero-overhead channel → TAP delivery
         if let Some(ref rx_recv) = handle.rx_receiver {
-            let tap_w = Arc::clone(&tap);
+            let tap_fd = tap.as_fd().as_raw_fd();
             let rx = rx_recv.clone();
-            let cancel = tunnel_cancel.clone();
-            let tid = tunnel_id;
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        result = tokio::task::spawn_blocking({
-                            let rx = rx.clone();
-                            move || rx.recv()
-                        }) => {
-                            match result {
-                                Ok(Ok(buf)) => {
-                                    let _ = tap_w.write(buf.as_slice()).await;
-                                }
-                                _ => break,
-                            }
-                        }
+            std::thread::Builder::new()
+                .name(format!("tap-wr-{tunnel_id}"))
+                .spawn(move || {
+                    while let Ok(buf) = rx.recv() {
+                        let data = buf.as_slice();
+                        unsafe { libc::write(tap_fd, data.as_ptr() as *const _, data.len()) };
                     }
-                }
-                tracing::debug!(tunnel_id = tid, "TAP writer stopped");
-            });
+                })
+                .expect("failed to spawn TAP writer thread");
         }
 
         // Spawn keepalive
