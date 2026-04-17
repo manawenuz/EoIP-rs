@@ -303,6 +303,136 @@ mod tests {
         }
     }
 
+    // ── MikroTik wire-compat tests (from real captures, Phase 3) ──
+
+    mod mikrotik_wire_compat {
+        use super::*;
+
+        // Exact EoIP header bytes extracted from mk-mk-idle.pcap packet #1
+        // 128.140.114.175 -> 78.47.55.197, keepalive, tunnel-id=100
+        const MK_KEEPALIVE_TID100: [u8; 8] = [0x20, 0x01, 0x64, 0x00, 0x00, 0x00, 0x64, 0x00];
+
+        // From mk-mk-idle.pcap packet #2 — keepalive, tunnel-id=200
+        const MK_KEEPALIVE_TID200: [u8; 8] = [0x20, 0x01, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x00];
+
+        // From mk-mk-arp.pcap packet #1 — ARP request (42-byte inner Ethernet frame)
+        const MK_ARP_REQ_HDR: [u8; 8] = [0x20, 0x01, 0x64, 0x00, 0x00, 0x2a, 0x64, 0x00];
+
+        // From mk-mk-ping.pcap packet #13 — ICMP ping (70-byte inner Ethernet frame)
+        const MK_PING_HDR: [u8; 8] = [0x20, 0x01, 0x64, 0x00, 0x00, 0x46, 0x64, 0x00];
+
+        // From mk-mk-mtu.pcap — 1400-byte ping (1414-byte inner frame)
+        const MK_MTU1400_HDR: [u8; 8] = [0x20, 0x01, 0x64, 0x00, 0x05, 0x86, 0x64, 0x00];
+
+        #[test]
+        fn decode_mikrotik_keepalive_tid100() {
+            let (tid, plen, hlen) = decode_eoip_header(&MK_KEEPALIVE_TID100).unwrap();
+            assert_eq!(tid, 100);
+            assert_eq!(plen, 0);
+            assert_eq!(hlen, 8);
+        }
+
+        #[test]
+        fn decode_mikrotik_keepalive_tid200() {
+            let (tid, plen, hlen) = decode_eoip_header(&MK_KEEPALIVE_TID200).unwrap();
+            assert_eq!(tid, 200);
+            assert_eq!(plen, 0);
+            assert_eq!(hlen, 8);
+        }
+
+        #[test]
+        fn decode_mikrotik_arp() {
+            let (tid, plen, hlen) = decode_eoip_header(&MK_ARP_REQ_HDR).unwrap();
+            assert_eq!(tid, 100);
+            assert_eq!(plen, 42); // 14 eth + 28 ARP
+            assert_eq!(hlen, 8);
+        }
+
+        #[test]
+        fn decode_mikrotik_ping() {
+            let (tid, plen, hlen) = decode_eoip_header(&MK_PING_HDR).unwrap();
+            assert_eq!(tid, 100);
+            assert_eq!(plen, 70); // 14 eth + 20 IP + 8 ICMP + 28 data
+            assert_eq!(hlen, 8);
+        }
+
+        #[test]
+        fn decode_mikrotik_mtu1400() {
+            let (tid, plen, hlen) = decode_eoip_header(&MK_MTU1400_HDR).unwrap();
+            assert_eq!(tid, 100);
+            assert_eq!(plen, 1414); // 14 eth + 1400 ICMP payload
+            assert_eq!(hlen, 8);
+        }
+
+        #[test]
+        fn encode_matches_mikrotik_keepalive() {
+            let mut buf = [0u8; 8];
+            encode_eoip_header(100, 0, &mut buf).unwrap();
+            assert_eq!(buf, MK_KEEPALIVE_TID100);
+        }
+
+        #[test]
+        fn encode_matches_mikrotik_keepalive_tid200() {
+            let mut buf = [0u8; 8];
+            encode_eoip_header(200, 0, &mut buf).unwrap();
+            assert_eq!(buf, MK_KEEPALIVE_TID200);
+        }
+
+        #[test]
+        fn encode_matches_mikrotik_arp() {
+            let mut buf = [0u8; 8];
+            encode_eoip_header(100, 42, &mut buf).unwrap();
+            assert_eq!(buf, MK_ARP_REQ_HDR);
+        }
+
+        #[test]
+        fn encode_matches_mikrotik_ping() {
+            let mut buf = [0u8; 8];
+            encode_eoip_header(100, 70, &mut buf).unwrap();
+            assert_eq!(buf, MK_PING_HDR);
+        }
+
+        #[test]
+        fn encode_matches_mikrotik_mtu1400() {
+            let mut buf = [0u8; 8];
+            encode_eoip_header(100, 1414, &mut buf).unwrap();
+            assert_eq!(buf, MK_MTU1400_HDR);
+        }
+
+        #[test]
+        fn validate_mikrotik_keepalive_packet() {
+            validate_eoip_packet(&MK_KEEPALIVE_TID100, 8).unwrap();
+        }
+
+        #[test]
+        fn validate_mikrotik_arp_packet() {
+            let mut pkt = vec![0u8; 8 + 42];
+            pkt[..8].copy_from_slice(&MK_ARP_REQ_HDR);
+            validate_eoip_packet(&pkt, 50).unwrap();
+        }
+
+        #[test]
+        fn roundtrip_all_mikrotik_headers() {
+            for (tid, plen, mk_bytes) in [
+                (100u16, 0u16, MK_KEEPALIVE_TID100),
+                (200, 0, MK_KEEPALIVE_TID200),
+                (100, 42, MK_ARP_REQ_HDR),
+                (100, 70, MK_PING_HDR),
+                (100, 1414, MK_MTU1400_HDR),
+            ] {
+                // Decode MikroTik bytes
+                let (d_tid, d_plen, _) = decode_eoip_header(&mk_bytes).unwrap();
+                assert_eq!(d_tid, tid, "decode tid mismatch for plen={plen}");
+                assert_eq!(d_plen, plen, "decode plen mismatch for tid={tid}");
+
+                // Re-encode and verify byte-identical
+                let mut buf = [0u8; 8];
+                encode_eoip_header(tid, plen, &mut buf).unwrap();
+                assert_eq!(buf, mk_bytes, "encode mismatch for tid={tid} plen={plen}");
+            }
+        }
+    }
+
     // ── Property tests ────────────────────────────────────────────
 
     mod proptests {

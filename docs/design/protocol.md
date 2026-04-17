@@ -1,6 +1,6 @@
 # EoIP-rs Protocol Specification
 
-**Version:** 1.0-draft  
+**Version:** 1.1 (validated against MikroTik RouterOS 7.18.2 wire captures)  
 **Date:** 2026-04-17
 
 ---
@@ -337,10 +337,10 @@ Frame length = `ipv6_payload_length - 2`.
 
 ### 8.1 Outer Path MTU
 
-**Raw IP modes (A, B):**
-- Set `IP_MTU_DISCOVER = IP_PMTUDISC_DO` on the raw socket.
-- Kernel returns ICMP "Fragmentation Needed" / ICMPv6 "Packet Too Big".
-- On PMTU change: update cached path MTU, recalculate TAP interface MTU, log.
+**Raw IP modes (A, B) — MikroTik-compatible default:**
+- Set `IP_MTU_DISCOVER = IP_PMTUDISC_DONT` on the raw socket (DF=0).
+- MikroTik sets DF=0 by default (`dont-fragment=no` in RouterOS), allowing the network to fragment oversized outer packets.
+- This is the default for interop. Inner fragmentation is preferred (see §9.2).
 
 **UDP modes (C-F):**
 - Set `IP_MTU_DISCOVER = IP_PMTUDISC_DO` on the UDP socket.
@@ -360,8 +360,8 @@ EoIP operates at L2 — the TAP interface MTU controls inner IP packet size. Inn
 
 ### 9.1 Principles
 
-1. **Outer packets SHOULD NOT be fragmented.** Set DF bit on IPv4; IPv6 does not fragment at routers.
-2. **Rely on PMTU discovery** to size the TAP MTU so encapsulated frames fit.
+1. **Inner packets are fragmented before encapsulation**, not after. MikroTik fragments inner IP at the EoIP MTU boundary (1458 bytes for Mode A), then encapsulates each fragment separately. Each resulting outer packet stays under the path MTU.
+2. **Outer DF=0 by default** for MikroTik compatibility. The TAP MTU (1458) prevents most oversized packets.
 3. **No reassembly** by EoIP-rs for outer packets — the OS stack reassembles before delivering to the socket.
 
 ### 9.2 On EMSGSIZE
@@ -377,13 +377,14 @@ If the path supports jumbo frames (MTU > 1500):
 - EoIP's 16-bit payload length supports frames up to 65535 bytes.
 - EoIPv6 relies on IPv6's 16-bit Payload Length (65535 - 2 = 65533 byte frames).
 
-### 9.4 Fallback: Fragmentation-Permissive Mode
+### 9.4 MikroTik Fragmentation Behavior (Validated)
 
-Optional config to clear the DF bit. Trades performance for compatibility when PMTU discovery is broken (e.g., ICMP blackholed). Logs a warning at startup.
-
-```toml
-allow_fragmentation = false  # default
-```
+Observed in captures with RouterOS 7.18.2:
+- Inner ICMP payloads exceeding 1458 bytes are fragmented at the inner IP level.
+- Each inner fragment is encapsulated in its own EoIP packet.
+- Maximum observed EoIP payload_len: 1466 bytes (1458 + 8-byte ICMP header).
+- Outer IP packets never exceeded 1494 bytes (20 IP + 8 EoIP + 1466 inner).
+- No outer IP fragmentation observed.
 
 ---
 
@@ -476,7 +477,39 @@ UDP payload size: 4 + 8 + 64 = 76 bytes. Total on wire (IPv4): 20 + 8 + 76 = 104
 
 ---
 
-## 13. Security Considerations
+## 13. Validated MikroTik IP-Layer Behavior
+
+The following was confirmed via wire captures from RouterOS 7.18.2 CHR-to-CHR tunnels (Phase 3 analysis):
+
+| Parameter | MikroTik Value | EoIP-rs Setting |
+|-----------|---------------|-----------------|
+| IP TTL (IPv4) | 255 | `setsockopt(IP_TTL, 255)` |
+| IPv6 Hop Limit | 255 | `setsockopt(IPV6_UNICAST_HOPS, 255)` |
+| Don't Fragment (DF) | 0 (off) | `IP_PMTUDISC_DONT` |
+| DSCP/ToS | 0x00 | Default (0) |
+| Inner Ethernet FCS | Stripped (not present in tunnel) | TAP layer handles automatically |
+| Keepalive interval | 10s (configurable) | Default 10s |
+| Keepalive timeout | 100s (10 retries * 10s) | Default 100s |
+| Keepalive direction | Bidirectional (both sides send independently) | Both sides send |
+| Tunnel MTU | 1458 (Mode A) | Default 1458 |
+
+### 13.1 Background L2 Traffic
+
+MikroTik sends link-layer discovery and management traffic through EoIP tunnels automatically. An "idle" tunnel carries:
+- **MNDP** (MikroTik Neighbor Discovery, ethertype 0x0074, dst `01:00:0c:cc:cc:cc`)
+- **LLDP** (ethertype 0x88cc, dst `01:80:c2:00:00:0e`)
+- **IPv6 Router Advertisements** (dst `33:33:00:00:00:01`)
+- **Gratuitous ARP** (dst `ff:ff:ff:ff:ff:ff`)
+
+EoIP-rs passes all ethertypes transparently — no filtering.
+
+### 13.2 Firewall Interaction
+
+RouterOS processes EoIP (GRE protocol 47) at the kernel/driver level **before** any firewall chain. Neither `ip firewall filter` nor `ip firewall raw` can intercept EoIP keepalive packets. This means firewall-based keepalive testing requires disabling the EoIP interface directly.
+
+---
+
+## 14. Security Considerations
 
 1. **No encryption or authentication.** Must be layered over an encrypted transport.
 2. **Tunnel ID is not a security mechanism.** 16-bit provides demultiplexing, not access control.

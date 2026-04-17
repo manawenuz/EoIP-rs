@@ -147,10 +147,10 @@ fn default_max_batch_size() -> usize { 64 }
 fn default_batch_timeout_us() -> u64 { 50 }
 fn default_channel_buffer() -> usize { 1024 }
 fn default_rx_workers() -> usize { 1 }
-fn default_mtu() -> u16 { 1500 }
+fn default_mtu() -> u16 { 1458 }
 fn default_enabled() -> bool { true }
 fn default_keepalive_interval_secs() -> u64 { 10 }
-fn default_keepalive_timeout_secs() -> u64 { 30 }
+fn default_keepalive_timeout_secs() -> u64 { 100 }
 
 /// Parse and validate a TOML config file.
 pub fn parse_config(path: &Path) -> Result<Config, DaemonError> {
@@ -342,6 +342,6 @@ remote = "10.0.0.2"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.tunnels[0].keepalive_interval_secs, 10);
-        assert_eq!(config.tunnels[0].keepalive_timeout_secs, 30);
+        assert_eq!(config.tunnels[0].keepalive_timeout_secs, 100);
     }
 }

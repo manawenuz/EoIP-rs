@@ -27,7 +27,29 @@ pub fn create_raw_socket_v4() -> Result<OwnedFd, EoipError> {
     // IP_HDRINCL = false (default) — kernel prepends IP header on TX,
     // but we receive the full IP header on RX for raw sockets.
 
-    tracing::info!("created raw socket: AF_INET, SOCK_RAW, proto=47 (EoIP)");
+    // MikroTik uses TTL=255 for EoIP packets (confirmed via wire capture).
+    // Linux default is 64, which would cause interop issues.
+    sock.set_ttl(255)?;
+
+    // MikroTik sets DF=0 (allow fragmentation). Disable PMTU discovery
+    // so the kernel doesn't set the DF bit on outgoing packets.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // IP_PMTUDISC_DONT = 0
+        let val: libc::c_int = libc::IP_PMTUDISC_DONT;
+        unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&val) as libc::socklen_t,
+            );
+        }
+    }
+
+    tracing::info!("created raw socket: AF_INET, SOCK_RAW, proto=47 (EoIP), ttl=255, df=0");
     Ok(OwnedFd::from(sock))
 }
 
@@ -44,6 +66,9 @@ pub fn create_raw_socket_v6() -> Result<OwnedFd, EoipError> {
     sock.set_only_v6(true)?;
     sock.set_nonblocking(true)?;
 
-    tracing::info!("created raw socket: AF_INET6, SOCK_RAW, proto=97 (EtherIP)");
+    // Match MikroTik hop limit of 255 (IPv6 equivalent of TTL).
+    sock.set_unicast_hops_v6(255)?;
+
+    tracing::info!("created raw socket: AF_INET6, SOCK_RAW, proto=97 (EtherIP), hops=255");
     Ok(OwnedFd::from(sock))
 }
