@@ -50,14 +50,32 @@ impl WinTapDevice {
         }
 
         let dev = Self { handle };
-        dev.set_media_status(true)?;
+
+        // Set media status to connected with retry.
+        // The first call may fail or not take effect immediately
+        // on overlapped handles, so we retry after a short delay.
+        for attempt in 0..3 {
+            match dev.set_media_status(true) {
+                Ok(()) => break,
+                Err(e) if attempt < 2 => {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    eprintln!("TAP set_media_status retry {}: {}", attempt + 1, e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         Ok(dev)
     }
 
     /// Set the TAP adapter media status (connected/disconnected).
-    fn set_media_status(&self, connected: bool) -> io::Result<()> {
+    ///
+    /// Public so the daemon can re-call it after configuring the adapter.
+    pub fn set_media_status(&self, connected: bool) -> io::Result<()> {
         let status: u32 = if connected { 1 } else { 0 };
         let mut bytes_returned: u32 = 0;
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = unsafe { CreateEventW(std::ptr::null(), TRUE as _, FALSE as _, std::ptr::null()) };
 
         let ok = unsafe {
             DeviceIoControl(
@@ -68,22 +86,36 @@ impl WinTapDevice {
                 std::ptr::null_mut(),
                 0,
                 &mut bytes_returned,
-                std::ptr::null_mut(),
+                &mut overlapped,
             )
         };
 
-        if ok == 0 {
-            Err(io::Error::last_os_error())
-        } else {
+        let result = if ok != 0 {
             Ok(())
+        } else {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_IO_PENDING {
+                unsafe { GetOverlappedResult(self.handle, &overlapped, &mut bytes_returned, TRUE as _) };
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(err as i32))
+            }
+        };
+
+        if !overlapped.hEvent.is_null() {
+            unsafe { CloseHandle(overlapped.hEvent) };
         }
+        result
     }
 
-    /// Read an Ethernet frame from the TAP device (blocking).
+    /// Read an Ethernet frame from the TAP device (blocking via overlapped wait).
     pub fn read_blocking(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut bytes_read: u32 = 0;
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         overlapped.hEvent = unsafe { CreateEventW(std::ptr::null(), TRUE as _, FALSE as _, std::ptr::null()) };
+        if overlapped.hEvent.is_null() {
+            return Err(io::Error::last_os_error());
+        }
 
         let ok = unsafe {
             ReadFile(
@@ -95,25 +127,36 @@ impl WinTapDevice {
             )
         };
 
-        if ok == 0 {
+        let result = if ok != 0 {
+            Ok(bytes_read as usize)
+        } else {
             let err = unsafe { GetLastError() };
             if err == ERROR_IO_PENDING {
-                unsafe { GetOverlappedResult(self.handle, &overlapped, &mut bytes_read, 1) };
+                let wait_ok = unsafe {
+                    GetOverlappedResult(self.handle, &overlapped, &mut bytes_read, TRUE as _)
+                };
+                if wait_ok != 0 {
+                    Ok(bytes_read as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
             } else {
-                unsafe { CloseHandle(overlapped.hEvent) };
-                return Err(io::Error::from_raw_os_error(err as i32));
+                Err(io::Error::from_raw_os_error(err as i32))
             }
-        }
+        };
 
         unsafe { CloseHandle(overlapped.hEvent) };
-        Ok(bytes_read as usize)
+        result
     }
 
-    /// Write an Ethernet frame to the TAP device (blocking).
+    /// Write an Ethernet frame to the TAP device (blocking via overlapped wait).
     pub fn write_blocking(&self, buf: &[u8]) -> io::Result<usize> {
         let mut bytes_written: u32 = 0;
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         overlapped.hEvent = unsafe { CreateEventW(std::ptr::null(), TRUE as _, FALSE as _, std::ptr::null()) };
+        if overlapped.hEvent.is_null() {
+            return Err(io::Error::last_os_error());
+        }
 
         let ok = unsafe {
             WriteFile(
@@ -125,18 +168,26 @@ impl WinTapDevice {
             )
         };
 
-        if ok == 0 {
+        let result = if ok != 0 {
+            Ok(bytes_written as usize)
+        } else {
             let err = unsafe { GetLastError() };
             if err == ERROR_IO_PENDING {
-                unsafe { GetOverlappedResult(self.handle, &overlapped, &mut bytes_written, 1) };
+                let wait_ok = unsafe {
+                    GetOverlappedResult(self.handle, &overlapped, &mut bytes_written, TRUE as _)
+                };
+                if wait_ok != 0 {
+                    Ok(bytes_written as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
             } else {
-                unsafe { CloseHandle(overlapped.hEvent) };
-                return Err(io::Error::from_raw_os_error(err as i32));
+                Err(io::Error::from_raw_os_error(err as i32))
             }
-        }
+        };
 
         unsafe { CloseHandle(overlapped.hEvent) };
-        Ok(bytes_written as usize)
+        result
     }
 }
 

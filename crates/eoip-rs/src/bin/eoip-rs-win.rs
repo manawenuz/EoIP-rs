@@ -89,8 +89,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let divert = WinDivert::network(&filter, 0, WinDivertFlags::new())?;
     tracing::info!("WinDivert RX handle opened");
 
-    // TX: separate send-only handle
-    let tx_divert = WinDivert::network("false", 0, WinDivertFlags::new().set_send_only())?;
+    // TX: use a handle that captures all outbound GRE (so send works)
+    let tx_divert = WinDivert::network("ip.Protocol == 47 and outbound", -1, WinDivertFlags::new().set_send_only())?;
     tracing::info!("WinDivert TX handle opened");
 
     // Spawn TX thread: TAP read → EoIP encode → WinDivert inject
@@ -109,8 +109,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     build_ip_header(&mut pkt[..20], total_len, 47, &tx_local, &tx_remote);
 
                     if gre::encode_eoip_header(tx_tid, n as u16, &mut pkt[20..28]).is_ok() {
+                        let mut addr = unsafe { WinDivertAddress::<NetworkLayer>::new() };
+                        addr.set_outbound(true);
                         let packet = WinDivertPacket {
-                            address: unsafe { WinDivertAddress::<NetworkLayer>::new() },
+                            address: addr,
                             data: Cow::Borrowed(&pkt[..20 + EOIP_HEADER_LEN + n]),
                         };
                         match tx_divert.send(&packet) {
@@ -136,22 +138,37 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let ka_remote = tunnel_cfg.remote;
     let ka_tid = tunnel_cfg.tunnel_id;
     let ka_interval = std::time::Duration::from_secs(tunnel_cfg.keepalive_interval_secs);
-    let ka_divert = WinDivert::network("false", 0, WinDivertFlags::new().set_send_only())?;
+    let ka_divert = WinDivert::network("ip.Protocol == 47 and outbound", -2, WinDivertFlags::new().set_send_only())?;
 
     let _ka_thread = std::thread::spawn(move || {
         let mut pkt = [0u8; 20 + EOIP_HEADER_LEN];
         loop {
             build_ip_header(&mut pkt[..20], 28, 47, &ka_local, &ka_remote);
             if gre::encode_eoip_header(ka_tid, 0, &mut pkt[20..28]).is_ok() {
+                let mut addr = unsafe { WinDivertAddress::<NetworkLayer>::new() };
+                addr.set_outbound(true);
                 let packet = WinDivertPacket {
-                    address: unsafe { WinDivertAddress::<NetworkLayer>::new() },
+                    address: addr,
                     data: Cow::Borrowed(&pkt[..]),
                 };
-                let _ = ka_divert.send(&packet);
+                match ka_divert.send(&packet) {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(%e, "keepalive send failed"),
+                }
             }
             std::thread::sleep(ka_interval);
         }
     });
+
+    // Re-set media status after WinDivert is open and threads are spawned.
+    // Opening WinDivert may briefly disrupt the network stack, causing TAP
+    // to report Disconnected. Re-asserting media status fixes this.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    if let Err(e) = tap.set_media_status(true) {
+        tracing::warn!(%e, "failed to re-set TAP media status");
+    } else {
+        tracing::info!("TAP media status re-asserted");
+    }
 
     // Main thread: RX — WinDivert recv GRE → decode → TAP write
     tracing::info!("entering RX loop");
