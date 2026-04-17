@@ -83,6 +83,46 @@ Always teardown when not testing: `./teardown-chr.sh --all`
 - Check RouterOS version exists: `https://download.mikrotik.com/routeros/`
 - The script uses raw `.img.zip` format
 
+## Phase 2: MikroTik-to-MikroTik EoIP Baseline
+
+Once you have two CHR VMs from Phase 1, set up EoIP tunnels between them:
+
+```bash
+# Deploy two CHR VMs
+./deploy-chr.sh -n mk-a -k <your-ssh-key>
+./deploy-chr.sh -n mk-b -k <your-ssh-key>
+
+# Get their IPs
+MK_A=$(hcloud server ip mk-a)
+MK_B=$(hcloud server ip mk-b)
+
+# Configure EoIP tunnel pair (tunnel-id=100, 10.255.0.0/30)
+./setup-eoip-pair.sh -a $MK_A -b $MK_B
+
+# Full test: primary + second tunnel + EoIPv6 + keepalive + export configs
+./setup-eoip-pair.sh -a $MK_A -b $MK_B --multi --ipv6 --keepalive-test --export
+
+# Remove all EoIP tunnels from both VMs
+./setup-eoip-pair.sh -a $MK_A -b $MK_B --teardown
+```
+
+### setup-eoip-pair.sh options
+
+| Flag | Description |
+|------|-------------|
+| `-a, --mk-a IP` | First CHR VM IP (required) |
+| `-b, --mk-b IP` | Second CHR VM IP (required) |
+| `-u, --user` | RouterOS SSH user (default: `admin`) |
+| `--multi` | Add second tunnel (tunnel-id=200, 10.255.1.0/30) |
+| `--ipv6` | Add EoIPv6 tunnel (tunnel-id=42, 10.255.2.0/30) if IPv6 available |
+| `--keepalive-test` | Block/unblock GRE traffic to test keepalive failover |
+| `--export` | Save RouterOS `/export` to `tests/captures/mk-mk-baseline/` |
+| `--teardown` | Remove all EoIP tunnels from both VMs |
+
+### Captures
+
+Config exports and EoIP details are saved to `tests/captures/mk-mk-baseline/` with timestamps. These serve as the "known-good" baseline for protocol analysis in Phase 3.
+
 ## Architecture
 
 ```
@@ -94,4 +134,13 @@ Your Machine                    Hetzner Cloud (fsn1)
 └──────────┘                   └──────────────────┘
 ```
 
-Phase 2 adds a second VM for MikroTik-to-MikroTik EoIP baseline testing.
+Phase 2 establishes the MikroTik-to-MikroTik EoIP baseline — the ground truth for protocol analysis.
+
+```
+Your Machine                    Hetzner Cloud (fsn1)
+┌──────────┐                   ┌──────────┐     ┌──────────┐
+│ hcloud   │───── API ────────▶│  mk-a    │────▶│  mk-b    │
+│ CLI      │                   │  CHR     │EoIP │  CHR     │
+│          │◀──── SSH ────────▶│ .0.1/30  │◀────│ .0.2/30  │
+└──────────┘                   └──────────┘     └──────────┘
+```
