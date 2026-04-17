@@ -31,10 +31,10 @@ tunnel_id = 100
 local = "192.168.1.1"
 remote = "192.168.1.2"
 iface_name = "eoip-dc1"           # Optional: auto-generated as "eoip{id}" if omitted
-mtu = 1500
+mtu = 1458
 enabled = true
 keepalive_interval_secs = 10
-keepalive_timeout_secs = 30
+keepalive_timeout_secs = 100
 
 # [[tunnel]]
 # tunnel_id = 200
