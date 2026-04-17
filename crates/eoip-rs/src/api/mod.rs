@@ -10,17 +10,19 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
 use crate::config::ApiConfig;
+use crate::tunnel::manager::TunnelManager;
 use crate::tunnel::registry::TunnelRegistry;
 
 /// Start the gRPC API server.
 pub async fn start_grpc_server(
     registry: Arc<TunnelRegistry>,
+    manager: Arc<TunnelManager>,
     config: &ApiConfig,
     shutdown: CancellationToken,
 ) -> Result<(), tonic::transport::Error> {
     let addr = config.listen.parse().expect("invalid API listen address");
 
-    let tunnel_svc = tunnel_svc::TunnelServiceImpl::new(Arc::clone(&registry));
+    let tunnel_svc = tunnel_svc::TunnelServiceImpl::new(Arc::clone(&registry), manager);
     let stats_svc = stats_svc::StatsServiceImpl::new(Arc::clone(&registry));
     let health_svc = health_svc::HealthServiceImpl::new();
 

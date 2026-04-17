@@ -1,5 +1,6 @@
 //! TunnelService gRPC implementation.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -8,17 +9,20 @@ use tonic::{Request, Response, Status};
 
 use eoip_api::*;
 
+use crate::config::TunnelConfig;
+use crate::tunnel::manager::TunnelManager;
 use crate::tunnel::registry::TunnelRegistry;
 
 pub struct TunnelServiceImpl {
     registry: Arc<TunnelRegistry>,
+    manager: Arc<TunnelManager>,
     event_tx: broadcast::Sender<TunnelEvent>,
 }
 
 impl TunnelServiceImpl {
-    pub fn new(registry: Arc<TunnelRegistry>) -> Self {
+    pub fn new(registry: Arc<TunnelRegistry>, manager: Arc<TunnelManager>) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        Self { registry, event_tx }
+        Self { registry, manager, event_tx }
     }
 
     fn tunnel_to_proto(
@@ -52,13 +56,38 @@ impl TunnelServiceImpl {
 impl tunnel_service_server::TunnelService for TunnelServiceImpl {
     async fn create_tunnel(
         &self,
-        _request: Request<CreateTunnelRequest>,
+        request: Request<CreateTunnelRequest>,
     ) -> Result<Response<CreateTunnelResponse>, Status> {
-        // Dynamic tunnel creation requires helper communication.
-        // For now, return unimplemented — tunnels are created from config.
-        Err(Status::unimplemented(
-            "dynamic tunnel creation not yet supported; use config file",
-        ))
+        let req = request.into_inner();
+
+        let local: IpAddr = req.local_addr.parse()
+            .map_err(|_| Status::invalid_argument(format!("invalid local_addr: {}", req.local_addr)))?;
+        let remote: IpAddr = req.remote_addr.parse()
+            .map_err(|_| Status::invalid_argument(format!("invalid remote_addr: {}", req.remote_addr)))?;
+
+        let config = TunnelConfig {
+            tunnel_id: req.tunnel_id as u16,
+            local,
+            remote,
+            iface_name: if req.iface_name.is_empty() { None } else { Some(req.iface_name) },
+            mtu: if req.mtu == 0 { 1458 } else { req.mtu as u16 },
+            enabled: true,
+            keepalive_interval_secs: 10,
+            keepalive_timeout_secs: 100,
+        };
+
+        self.manager.create_tunnel(config).await
+            .map_err(|e| Status::internal(e))?;
+
+        // Return the created tunnel
+        let tid = req.tunnel_id as u16;
+        let entries = self.registry.find_by_tunnel_id(tid);
+        let (key, handle) = entries.first()
+            .ok_or_else(|| Status::internal("tunnel created but not found in registry"))?;
+
+        Ok(Response::new(CreateTunnelResponse {
+            tunnel: Some(Self::tunnel_to_proto(key, handle)),
+        }))
     }
 
     async fn delete_tunnel(
@@ -66,14 +95,8 @@ impl tunnel_service_server::TunnelService for TunnelServiceImpl {
         request: Request<DeleteTunnelRequest>,
     ) -> Result<Response<DeleteTunnelResponse>, Status> {
         let tid = request.into_inner().tunnel_id as u16;
-        let removed = self.registry.find_by_tunnel_id(tid);
-        if removed.is_empty() {
-            return Err(Status::not_found(format!("tunnel {tid} not found")));
-        }
-        for (key, _) in &removed {
-            self.registry.remove(key);
-        }
-        tracing::info!(tunnel_id = tid, "tunnel deleted via gRPC");
+        self.manager.destroy_tunnel(tid)
+            .map_err(|e| Status::not_found(e))?;
         Ok(Response::new(DeleteTunnelResponse {}))
     }
 
@@ -116,13 +139,8 @@ impl tunnel_service_server::TunnelService for TunnelServiceImpl {
             .first()
             .ok_or_else(|| Status::not_found(format!("tunnel {tid} not found")))?;
 
-        // Apply updates — currently only enabled state is mutable at runtime.
-        // MTU and keepalive changes would require restarting tunnel tasks.
-        if let Some(_enabled) = req.enabled {
-            // The enabled field is part of config which is immutable.
-            // For now, log the request. Full enable/disable requires stopping
-            // and restarting the tunnel's TX/RX tasks (future work).
-            tracing::info!(tunnel_id = tid, enabled = _enabled, "update_tunnel requested");
+        if let Some(enabled) = req.enabled {
+            tracing::info!(tunnel_id = tid, enabled, "update_tunnel requested");
         }
 
         let tunnel = Self::tunnel_to_proto(key, handle);
@@ -141,12 +159,11 @@ impl tunnel_service_server::TunnelService for TunnelServiceImpl {
         let rx = self.event_tx.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(|result| match result {
             Ok(event) => Some(Ok(event)),
-            Err(_) => None, // lagged — skip
+            Err(_) => None,
         });
 
         Ok(Response::new(Box::pin(stream)))
     }
 }
 
-// tokio_stream re-export for filter_map
 use tokio_stream::StreamExt;
