@@ -1,0 +1,696 @@
+{
+  "master": {
+    "tasks": [
+      {
+        "id": 1,
+        "title": "Initialize workspace crate structure and protocol library foundation",
+        "description": "Create the complete crate directory structure and implement core protocol types, error handling, and shared data structures in eoip-proto",
+        "details": "Create directories: crates/{eoip-proto,eoip-api,eoip-helper,eoip-rs}/src. Write Cargo.toml for eoip-proto with deps: bytes=\"1\", thiserror=\"2\". Implement:\n- src/types.rs: DemuxKey(tunnel_id: u16, peer_addr: IpAddr), TunnelId newtype, TunnelConfig/TunnelStats structs with AtomicU64 fields (tx/rx packets/bytes/errors, last_rx/tx timestamps)\n- src/error.rs: EoipError enum with thiserror derives covering InvalidGreHeader, InvalidEtherIpHeader, UnknownTunnel, PacketTooShort, TapError, RawSocket, HelperDisconnected, Config errors\n- src/wire.rs: Helper<->Daemon protocol messages (HelperMsg: TapCreated/RawSocket/Error/HelperReady, DaemonMsg: CreateTunnel/DestroyTunnel/Shutdown) with serde serialization\n- src/lib.rs: Re-export all public types\n\nUse #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)] for DemuxKey. Document all public APIs with /// comments explaining wire format compatibility.",
+        "testStrategy": "Unit tests verifying: DemuxKey equality/hashing behavior, error type Display implementations match expected messages, wire protocol message serialization roundtrips correctly",
+        "priority": "high",
+        "dependencies": [],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Create workspace directory structure and eoip-proto crate skeleton",
+            "description": "Create all required crate directories (crates/{eoip-proto,eoip-api,eoip-helper,eoip-rs}/src) and initialize the eoip-proto crate with its Cargo.toml configuration and lib.rs entry point",
+            "dependencies": [],
+            "details": "Execute: mkdir -p crates/{eoip-proto,eoip-api,eoip-helper,eoip-rs}/src. Create crates/eoip-proto/Cargo.toml with package metadata (name=\"eoip-proto\", version.workspace=true, edition.workspace=true), dependencies (bytes.workspace=true, thiserror.workspace=true), and documentation fields. Create crates/eoip-proto/src/lib.rs with module declarations (pub mod types; pub mod error; pub mod gre; pub mod etherip; pub mod udp_shim; pub mod wire;) and top-level doc comments explaining the protocol library purpose. Verify workspace membership is already configured in root Cargo.toml.",
+            "status": "pending",
+            "testStrategy": "Verify with 'cargo check -p eoip-proto' that crate compiles (will initially fail due to missing modules). Confirm directory structure with 'ls -R crates/' showing all four crate directories with src/ subdirectories."
+          },
+          {
+            "id": 2,
+            "title": "Implement core types module with DemuxKey, TunnelId, and statistics structures",
+            "description": "Create src/types.rs implementing DemuxKey (tunnel_id + peer_addr tuple), TunnelId newtype wrapper, TunnelConfig, and TunnelStats with AtomicU64 counters for packet/byte/error tracking",
+            "dependencies": [
+              1
+            ],
+            "details": "In crates/eoip-proto/src/types.rs: Define DemuxKey struct with #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)] containing tunnel_id: u16 and peer_addr: std::net::IpAddr. Create TunnelId newtype: pub struct TunnelId(pub u16); with validation method ensuring <= 4095 for EoIPv6 compatibility. Implement TunnelConfig struct with fields: tunnel_id: TunnelId, local_addr: IpAddr, remote_addr: IpAddr, mtu: u16, keepalive_interval: Duration, keepalive_timeout: Duration. Implement TunnelStats with atomic fields: tx_packets, tx_bytes, rx_packets, rx_bytes, tx_errors, rx_errors (all AtomicU64), plus last_rx_timestamp and last_tx_timestamp (AtomicI64 for Unix millis). Add /// doc comments on all public types explaining wire format constraints (e.g., TunnelId range limits for EoIPv6).",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) DemuxKey hash collision test with 1000 random IDs, (2) TunnelId validation rejects values > 4095, (3) TunnelStats atomic operations from multiple threads verify no data races, (4) Ensure IpAddr enum works with both IPv4/IPv6 in DemuxKey equality checks."
+          },
+          {
+            "id": 3,
+            "title": "Implement error types module with comprehensive EoipError enum",
+            "description": "Create src/error.rs defining EoipError enum with thiserror derives covering all protocol validation failures, I/O errors, and configuration errors as specified in architecture docs",
+            "dependencies": [
+              1
+            ],
+            "details": "In crates/eoip-proto/src/error.rs: Define #[derive(Debug, thiserror::Error)] pub enum EoipError with variants: InvalidGreHeader(String) with #[error(\"invalid GRE header: {0}\")], InvalidEtherIpHeader(String) with #[error(\"invalid EtherIP header: {0}\")], UnknownTunnel{tunnel_id: u16, peer_addr: IpAddr} with formatted error, PacketTooShort{got: usize, need: usize}, TunnelIdOutOfRange{id: u16, max: u16}, PayloadTooLarge{size: usize, limit: usize}, TapError{iface: String, source: std::io::Error}, RawSocketError(#[from] std::io::Error), HelperDisconnected, ConfigError(String), InvalidMagicBytes{expected: Vec<u8>, got: Vec<u8>}, InvalidVersion{expected: u8, got: u8}. Implement custom Display messages that include context about what was expected vs. received for debugging.",
+            "status": "pending",
+            "testStrategy": "Tests: (1) Verify Display implementations produce expected messages (e.g., PacketTooShort shows \"got 7, need 8\"), (2) Test std::io::Error conversion via #[from], (3) Verify all error variants implement Error trait and can be chained with .source(), (4) Test error serialization if implementing serde::Serialize for wire protocol."
+          },
+          {
+            "id": 4,
+            "title": "Implement helper-daemon wire protocol in src/wire.rs",
+            "description": "Create src/wire.rs implementing HelperMsg and DaemonMsg enums for IPC communication between privileged helper and unprivileged daemon, with serde serialization support",
+            "dependencies": [
+              1,
+              3
+            ],
+            "details": "In crates/eoip-proto/src/wire.rs: Add serde dependency to Cargo.toml. Define #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)] pub enum HelperMsg { TapCreated{iface_name: String, tunnel_id: u16}, RawSocket{address_family: u16 /* AF_INET=2 or AF_INET6=10 */}, Error{msg: String}, HelperReady }. Define matching DaemonMsg enum with variants: CreateTunnel{iface_name: String, tunnel_id: u16}, DestroyTunnel{iface_name: String}, Shutdown. Add helper functions: pub fn serialize_msg<T: Serialize>(msg: &T) -> Result<Vec<u8>, EoipError> using bincode/postcard (choose one) for compact binary serialization, and pub fn deserialize_msg<T: DeserializeOwned>(buf: &[u8]) -> Result<T, EoipError>. Document that FDs are passed separately via SCM_RIGHTS ancillary data (not in serialized payload).",
+            "status": "pending",
+            "testStrategy": "Tests: (1) Roundtrip serialization for all HelperMsg variants, (2) Roundtrip for all DaemonMsg variants, (3) Verify serialized size is compact (< 100 bytes for typical messages), (4) Test handling of malformed/truncated input returns appropriate EoipError, (5) Verify backward compatibility if enum variants are added (if using tagged format)."
+          },
+          {
+            "id": 5,
+            "title": "Complete eoip-proto with lib.rs re-exports and documentation",
+            "description": "Finalize crates/eoip-proto/src/lib.rs by re-exporting all public types from submodules and adding comprehensive crate-level documentation with usage examples",
+            "dependencies": [
+              2,
+              3,
+              4
+            ],
+            "details": "In crates/eoip-proto/src/lib.rs: Add #![doc = include_str!(\"../../docs/design/protocol.md\")] to embed protocol specification in rustdoc. Create module declarations: pub mod types; pub mod error; pub mod wire; (gre, etherip, udp_shim will be added in later tasks). Re-export commonly used types at crate root: pub use types::{DemuxKey, TunnelId, TunnelConfig, TunnelStats}; pub use error::EoipError; pub use wire::{HelperMsg, DaemonMsg}; Add top-level doc comment: /// Pure Rust implementation of MikroTik EoIP/EoIPv6 protocol codecs. /// This crate provides zero-copy encode/decode for GRE-based EoIP (IPv4, protocol 47), /// RFC 3378 EtherIP (IPv6, protocol 97), and UDP encapsulation mode. Add /// # Examples section showing basic DemuxKey usage. Verify 'cargo doc --open -p eoip-proto' generates clean documentation.",
+            "status": "pending",
+            "testStrategy": "Integration tests in tests/lib_test.rs: (1) Import all public types without path qualification, (2) Verify DemuxKey can be created and hashed, (3) Verify EoipError variants are accessible, (4) Run 'cargo doc -p eoip-proto' and check for warnings, (5) Verify doctests compile and pass with 'cargo test --doc -p eoip-proto'."
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Implement EoIP GRE header codec with mixed-endianness handling",
+        "description": "Implement MikroTik-compatible EoIP header encode/decode in eoip-proto with byte-level precision for magic validation, big-endian payload length, and little-endian tunnel ID",
+        "details": "Create src/gre.rs with:\n- encode_eoip_header(tunnel_id: u16, payload_len: u16, buf: &mut [u8]) -> Result<(), EoipError>: Write [0x20,0x01,0x64,0x00], payload_len.to_be_bytes(), tunnel_id.to_le_bytes()\n- decode_eoip_header(buf: &[u8]) -> Result<(u16 tunnel_id, u16 payload_len, usize header_len), EoipError>: Validate magic == [0x20,0x01,0x64,0x00], extract BE payload_len from buf[4..6], LE tunnel_id from buf[6..8]\n- validate_eoip_packet(buf: &[u8], ip_payload_len: usize) -> Result<(), EoipError>: Check len>=8, magic correct, payload_len <= ip_payload_len-8, payload_len >= 14\n\nUse bytes::BufMut for zero-copy writing. Return PacketTooShort if buf.len() < 8. Document mixed endianness with CRITICAL comment.",
+        "testStrategy": "Property tests with proptest: encode→decode roundtrips for all u16 tunnel_ids. Byte-level tests verifying TID=42 produces [0x2A,0x00] at offset 6, payload_len=64 produces [0x00,0x40] at offset 4. Negative tests: wrong magic, short buffers, payload_len exceeds bounds",
+        "priority": "high",
+        "dependencies": [
+          1
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Create gre.rs module skeleton with constants and function signatures",
+            "description": "Create the src/gre.rs file in eoip-proto crate with magic byte constants, function signatures, and comprehensive documentation about MikroTik EoIP header format",
+            "dependencies": [],
+            "details": "Create crates/eoip-proto/src/gre.rs with: (1) Module-level doc comment explaining MikroTik EoIP uses non-standard GRE variant with 8-byte header format [magic:4B][payload_len:2B BE][tunnel_id:2B LE]. (2) Define public constant: pub const EOIP_MAGIC: [u8; 4] = [0x20, 0x01, 0x64, 0x00]; (3) Define EOIP_HEADER_LEN: usize = 8; (4) Add CRITICAL comment documenting mixed-endianness: payload_len is big-endian (network byte order) but tunnel_id is little-endian (x86 byte order) per MikroTik implementation. (5) Add function signatures: pub fn encode_eoip_header(tunnel_id: u16, payload_len: u16, buf: &mut [u8]) -> Result<(), EoipError>; pub fn decode_eoip_header(buf: &[u8]) -> Result<(u16, u16, usize), EoipError>; pub fn validate_eoip_packet(buf: &[u8], ip_payload_len: usize) -> Result<(), EoipError>. (6) Add use statements: use crate::error::EoipError; use bytes::BufMut;",
+            "status": "pending",
+            "testStrategy": "Verify module compiles with 'cargo check -p eoip-proto'. Confirm constants are correctly defined by writing a simple test that checks EOIP_MAGIC == [0x20, 0x01, 0x64, 0x00] and EOIP_HEADER_LEN == 8."
+          },
+          {
+            "id": 2,
+            "title": "Implement encode_eoip_header with buffer length validation and mixed-endian writes",
+            "description": "Implement the encode_eoip_header function that writes the 8-byte MikroTik EoIP header with proper byte ordering: magic bytes, big-endian payload length, and little-endian tunnel ID",
+            "dependencies": [
+              1
+            ],
+            "details": "In encode_eoip_header function: (1) Check buf.len() >= 8, return Err(EoipError::PacketTooShort{got: buf.len(), need: 8}) if insufficient. (2) Write magic bytes at offset 0-3: buf[0..4].copy_from_slice(&EOIP_MAGIC). (3) Write payload_len in big-endian at offset 4-5: buf[4..6].copy_from_slice(&payload_len.to_be_bytes()). (4) Write tunnel_id in little-endian at offset 6-7: buf[6..8].copy_from_slice(&tunnel_id.to_le_bytes()). (5) Return Ok(()). (6) Add comprehensive doc comment with example showing TID=100, payload_len=60 produces [0x20,0x01,0x64,0x00,0x00,0x3C,0x64,0x00]. (7) Add inline comment before tunnel_id write: // CRITICAL: tunnel_id is little-endian per MikroTik spec, NOT network byte order. Avoid using bytes::BufMut initially for simplicity - direct slice writes are clearer for exact byte positioning.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) encode_eoip_header(42, 64, &mut buf) verifies buf == [0x20,0x01,0x64,0x00,0x00,0x40,0x2A,0x00] byte-by-byte. (2) Test with TID=0x1234, payload=0x5678 produces correct BE/LE bytes at expected offsets. (3) Test with 7-byte buffer returns PacketTooShort error. (4) Test buffer exactly 8 bytes succeeds."
+          },
+          {
+            "id": 3,
+            "title": "Implement decode_eoip_header with magic validation and mixed-endian reads",
+            "description": "Implement decode_eoip_header to parse the 8-byte EoIP header, validate magic bytes, and extract big-endian payload length and little-endian tunnel ID",
+            "dependencies": [
+              1
+            ],
+            "details": "In decode_eoip_header function: (1) Check buf.len() >= 8, return Err(EoipError::PacketTooShort{got: buf.len(), need: 8}). (2) Validate magic bytes: if &buf[0..4] != EOIP_MAGIC, return Err(EoipError::InvalidMagicBytes{expected: EOIP_MAGIC.to_vec(), got: buf[0..4].to_vec()}). (3) Extract payload_len in big-endian: let payload_len = u16::from_be_bytes([buf[4], buf[5]]). (4) Extract tunnel_id in little-endian: let tunnel_id = u16::from_le_bytes([buf[6], buf[7]]). (5) Return Ok((tunnel_id, payload_len, EOIP_HEADER_LEN)). (6) Add doc comment explaining return tuple: (tunnel_id, payload_len, header_length), where header_length is always 8 for standard EoIP. (7) Add inline comment: // CRITICAL: Read tunnel_id as little-endian, NOT big-endian.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) Decode [0x20,0x01,0x64,0x00,0x00,0x40,0x2A,0x00] returns (42, 64, 8). (2) Worked example: [0x20,0x01,0x64,0x00,0x12,0x34,0xAB,0xCD] returns tunnel_id=0xCDAB (52651), payload_len=0x1234 (4660). (3) Wrong magic [0x20,0x01,0x64,0x01,...] returns InvalidMagicBytes error. (4) 7-byte buffer returns PacketTooShort. (5) Verify decode(encode(tid, len)) roundtrips correctly."
+          },
+          {
+            "id": 4,
+            "title": "Implement validate_eoip_packet with Ethernet frame size constraints",
+            "description": "Implement validate_eoip_packet to perform holistic packet validation including header presence, magic bytes, and payload length bounds checking against IP payload size and minimum Ethernet frame requirements",
+            "dependencies": [
+              1,
+              3
+            ],
+            "details": "In validate_eoip_packet function taking buf: &[u8] and ip_payload_len: usize: (1) Check buf.len() >= 8, return PacketTooShort error. (2) Validate magic bytes match EOIP_MAGIC, return InvalidGreHeader error with descriptive message if mismatch. (3) Extract payload_len via decode_eoip_header (reuse existing function) or inline read. (4) Validate payload_len >= 14 (minimum Ethernet frame: 6B dst + 6B src + 2B type), return Err(EoipError::PayloadTooSmall{got: payload_len, min: 14}) if smaller. (5) Validate payload_len <= ip_payload_len - 8 (must fit in IP payload after header), return Err(EoipError::PayloadTooLarge{size: payload_len as usize, limit: ip_payload_len - 8}) if exceeds. (6) Validate total buf.len() >= 8 + payload_len as usize, return PacketTooShort if incomplete. (7) Return Ok(()). Add doc comment explaining this validates packet is well-formed before demux lookup.",
+            "status": "pending",
+            "testStrategy": "Tests: (1) Valid packet: 8B header + 60B payload with ip_payload_len=68 passes. (2) payload_len=13 (too small for Ethernet) returns PayloadTooSmall error. (3) payload_len=100 but ip_payload_len=50 returns PayloadTooLarge. (4) Truncated buffer (buf.len()=10, payload_len=60) returns PacketTooShort. (5) Wrong magic bytes caught. (6) Boundary: payload_len=14 (minimum valid Ethernet) passes."
+          },
+          {
+            "id": 5,
+            "title": "Add comprehensive property tests and integration tests for GRE codec",
+            "description": "Create property-based tests using proptest to verify encode/decode roundtrips for all valid tunnel IDs and payload lengths, plus integration tests demonstrating real-world packet handling",
+            "dependencies": [
+              2,
+              3,
+              4
+            ],
+            "details": "In crates/eoip-proto/src/gre.rs add #[cfg(test)] mod tests: (1) Add proptest dependency to Cargo.toml dev-dependencies. (2) Write proptest: proptest! { #[test] fn roundtrip_all_tunnel_ids(tid in 0u16..=65535, plen in 14u16..=1500) { let mut buf = vec![0u8; 8]; encode_eoip_header(tid, plen, &mut buf).unwrap(); let (decoded_tid, decoded_plen, hdr_len) = decode_eoip_header(&buf).unwrap(); assert_eq!(decoded_tid, tid); assert_eq!(decoded_plen, plen); assert_eq!(hdr_len, 8); } }. (3) Add byte-exact tests: test_encode_tid_42() verifying buf[6]==0x2A && buf[7]==0x00, test_encode_payload_len_64() verifying buf[4]==0x00 && buf[5]==0x40. (4) Add negative tests: test_short_buffer_encode() with 7-byte buf, test_short_buffer_decode() with 7-byte buf, test_wrong_magic() with corrupted magic bytes. (5) Add integration test in tests/gre_integration.rs: create full EoIP packet with Ethernet payload (14B header + 46B data), encode header, validate, decode, verify payload extraction.",
+            "status": "pending",
+            "testStrategy": "Run 'cargo test -p eoip-proto gre' to execute all tests. Verify proptest runs 256+ iterations. Confirm coverage of: (a) all u16 tunnel_id values via proptest, (b) byte-level endianness verification, (c) boundary conditions (payload_len=14, tid=0, tid=65535), (d) error paths (short buffers, invalid magic), (e) full encode→validate→decode workflow. Run with 'cargo test -- --nocapture' to see any debug output."
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Implement EoIPv6/EtherIP header codec with 12-bit tunnel ID nibble-packing",
+        "description": "Implement RFC 3378-based EoIPv6 header encode/decode with MikroTik tunnel ID encoding in reserved bits",
+        "details": "Create src/etherip.rs with:\n- encode_eoipv6_header(tunnel_id: u16, buf: &mut [u8]) -> Result<(), EoipError>: Validate tid <= 4095, write buf[0] = ((tid>>8) as u8)<<4 | 0x03, buf[1] = (tid&0xFF) as u8\n- decode_eoipv6_header(buf: &[u8]) -> Result<(u16 tunnel_id, usize header_len), EoipError>: Check buf.len()>=2, verify (buf[0]&0x0F)==0x03, extract tid = ((buf[0] as u16 >> 4) << 8) | buf[1] as u16\n- validate_eoipv6_packet(buf: &[u8], ipv6_payload_len: usize) -> Result<(), EoipError>: Check len>=16 (2B hdr+14B eth), version==0x3\n\nReturn error if tunnel_id > 4095 on encode. Document that tid=0 produces RFC 3378-compliant [0x03,0x00].",
+        "testStrategy": "Worked example tests: TID=300 (0x12C) produces [0x13,0x2C], TID=1000 (0x3E8) produces [0x33,0xE8]. Property tests: encode→decode for TID 0-4095. Boundary tests: TID=4095 OK, TID=4096 returns error. Version validation rejects 0x02/0x04",
+        "priority": "high",
+        "dependencies": [
+          1
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Create etherip.rs module with EoIPv6 constants and function signatures",
+            "description": "Create the src/etherip.rs file in eoip-proto crate with RFC 3378 version constant, header length definition, function signatures, and comprehensive documentation about MikroTik's 12-bit tunnel ID nibble-packing into reserved bits",
+            "dependencies": [],
+            "details": "Create crates/eoip-proto/src/etherip.rs with: (1) Module-level doc comment explaining RFC 3378 EtherIP format with 2-byte header [version:4b=0x3][reserved:12b] and how MikroTik encodes tunnel_id in reserved bits as [tid_hi:4b][version:4b=0x3][tid_lo:8b]. (2) Define public constants: pub const ETHERIP_VERSION: u8 = 0x03; pub const ETHERIP_HEADER_LEN: usize = 2; pub const MAX_EOIPV6_TUNNEL_ID: u16 = 4095; (3) Add detailed comment explaining bit layout: Byte 0 bits[7:4]=TID[11:8], bits[3:0]=version(0x3); Byte 1 bits[7:0]=TID[7:0]. (4) Add function signatures: pub fn encode_eoipv6_header(tunnel_id: u16, buf: &mut [u8]) -> Result<(), EoipError>; pub fn decode_eoipv6_header(buf: &[u8]) -> Result<(u16, usize), EoipError>; pub fn validate_eoipv6_packet(buf: &[u8], ipv6_payload_len: usize) -> Result<(), EoipError>. (5) Add use statement: use crate::error::EoipError. (6) Add worked example in doc comment showing TID=300 (0x12C) encodes to [0x13, 0x2C] and TID=1000 (0x3E8) encodes to [0x33, 0xE8]. (7) Document that TID=0 produces RFC 3378-compliant [0x03, 0x00] packet.",
+            "status": "pending",
+            "testStrategy": "Verify module compiles with 'cargo check -p eoip-proto'. Write test confirming constants: ETHERIP_VERSION == 0x03, ETHERIP_HEADER_LEN == 2, MAX_EOIPV6_TUNNEL_ID == 4095. Test that module is accessible from lib.rs after adding 'pub mod etherip;' declaration."
+          },
+          {
+            "id": 2,
+            "title": "Implement encode_eoipv6_header with tunnel ID validation and nibble-packing",
+            "description": "Implement the encode_eoipv6_header function that validates tunnel_id <= 4095, then writes 2-byte EoIPv6 header with upper 4 bits of tunnel_id packed into high nibble of byte 0, version 0x3 in low nibble of byte 0, and lower 8 bits of tunnel_id in byte 1",
+            "dependencies": [
+              1
+            ],
+            "details": "In encode_eoipv6_header function: (1) Validate tunnel_id <= MAX_EOIPV6_TUNNEL_ID (4095), return Err(EoipError::TunnelIdOutOfRange{id: tunnel_id, max: 4095}) if exceeds. (2) Check buf.len() >= 2, return Err(EoipError::PacketTooShort{got: buf.len(), need: 2}) if insufficient. (3) Mask tunnel_id to 12 bits: let tid = tunnel_id & 0x0FFF; (defensive even after validation). (4) Extract high 4 bits: let tid_hi = (tid >> 8) as u8; (5) Extract low 8 bits: let tid_lo = (tid & 0xFF) as u8; (6) Encode byte 0 as: buf[0] = (tid_hi << 4) | ETHERIP_VERSION; combining high nibble of TID with version. (7) Encode byte 1 as: buf[1] = tid_lo; (8) Return Ok(()). (9) Add comprehensive doc comment with worked examples: TID=0 produces [0x03,0x00], TID=300 (0x12C) produces [0x13,0x2C], TID=4095 (0xFFF) produces [0xF3,0xFF]. (10) Add inline comment before buf[0] assignment: // Pack TID[11:8] into high nibble, version 0x3 into low nibble. (11) Document that this encoding makes TID=0 fully RFC 3378 compliant while non-zero TIDs use reserved bits.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) TID=0 produces [0x03,0x00]. (2) TID=300 produces [0x13,0x2C]. (3) TID=1000 produces [0x33,0xE8]. (4) TID=4095 produces [0xF3,0xFF]. (5) TID=4096 returns TunnelIdOutOfRange error. (6) TID=5000 returns TunnelIdOutOfRange error. (7) Buffer with len=1 returns PacketTooShort error. (8) All valid TIDs 0-4095 roundtrip through encode→decode correctly."
+          },
+          {
+            "id": 3,
+            "title": "Implement decode_eoipv6_header with version validation and nibble extraction",
+            "description": "Implement the decode_eoipv6_header function that validates buffer length, checks version field equals 0x3, then extracts 12-bit tunnel_id from nibble-packed format by combining high nibble of byte 0 with all of byte 1",
+            "dependencies": [
+              1
+            ],
+            "details": "In decode_eoipv6_header function: (1) Check buf.len() >= 2, return Err(EoipError::PacketTooShort{got: buf.len(), need: 2}) if insufficient. (2) Extract version from low nibble of byte 0: let version = buf[0] & 0x0F; (3) Validate version == ETHERIP_VERSION, return Err(EoipError::InvalidVersion{expected: ETHERIP_VERSION, got: version}) if mismatch. This rejects non-0x3 versions from other EtherIP implementations or corrupted packets. (4) Extract high 4 bits of tunnel_id from high nibble of byte 0: let tid_hi = (buf[0] >> 4) as u16; (5) Extract low 8 bits of tunnel_id from byte 1: let tid_lo = buf[1] as u16; (6) Combine to form 12-bit tunnel_id: let tunnel_id = (tid_hi << 8) | tid_lo; (7) Return Ok((tunnel_id, ETHERIP_HEADER_LEN)). The returned header_len allows caller to skip past header to Ethernet payload. (8) Add comprehensive doc comment explaining the reverse operation of encode_eoipv6_header with bit manipulation details. (9) Add worked example showing [0x33,0xE8] decodes to TID=1000: (0x3>>4)<<8 | 0xE8 = 0x03<<8 | 0xE8 = 0x3E8 = 1000. (10) Add inline comment: // Version validation rejects RFC 3378 version 0x2 and future versions.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) [0x03,0x00] decodes to TID=0. (2) [0x13,0x2C] decodes to TID=300. (3) [0x33,0xE8] decodes to TID=1000. (4) [0xF3,0xFF] decodes to TID=4095. (5) [0x02,0x00] (version 0x2) returns InvalidVersion error. (6) [0x04,0x00] (version 0x4) returns InvalidVersion error. (7) Buffer with len=1 returns PacketTooShort error. (8) All 4096 valid encoded values 0x03-0xFF3 decode to correct TIDs 0-4095. (9) Property test: forall TID in 0-4095: decode(encode(TID)) == TID."
+          },
+          {
+            "id": 4,
+            "title": "Implement validate_eoipv6_packet with length and version checks",
+            "description": "Implement the validate_eoipv6_packet function that performs comprehensive validation: minimum length check for 2-byte header + 14-byte Ethernet frame, version field validation, and IPv6 payload length consistency check",
+            "dependencies": [
+              3
+            ],
+            "details": "In validate_eoipv6_packet function with signature (buf: &[u8], ipv6_payload_len: usize) -> Result<(), EoipError>: (1) Check buf.len() >= 16 (2 bytes header + 14 bytes minimum Ethernet frame), return Err(EoipError::PacketTooShort{got: buf.len(), need: 16}) if insufficient. (2) Check buf.len() == ipv6_payload_len for consistency (IPv6 Payload Length field should match actual payload), return Err(EoipError::InvalidEtherIpHeader(format!(\"buffer length {} does not match IPv6 payload length {}\", buf.len(), ipv6_payload_len))) if mismatch. This catches truncated packets. (3) Extract and validate version: let version = buf[0] & 0x0F; if version != ETHERIP_VERSION return Err(EoipError::InvalidVersion{expected: ETHERIP_VERSION, got: version}). (4) Calculate Ethernet frame length: let frame_len = buf.len() - ETHERIP_HEADER_LEN; (5) Validate minimum Ethernet frame: if frame_len < 14 return Err(EoipError::PayloadTooSmall{size: frame_len, min: 14}). (6) Return Ok(()). (7) Add doc comment explaining this is typically called on RX path before demultiplexing to tunnel based on source IP + decoded tunnel_id. (8) Document that this function does NOT decode tunnel_id - caller should use decode_eoipv6_header for that. This separation allows fast-path rejection of invalid packets without tunnel lookup.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) Valid packet [0x03,0x00] + 14-byte Ethernet frame with ipv6_payload_len=16 returns Ok. (2) Valid packet with 60-byte Ethernet frame returns Ok. (3) Buffer with 15 total bytes returns PacketTooShort (need 16). (4) Buffer with version 0x02 returns InvalidVersion. (5) buf.len()=20 but ipv6_payload_len=16 returns error. (6) Packet with only header [0x03,0x00] (len=2) returns PayloadTooSmall. (7) Maximum valid packet (header + 65533 byte frame, within IPv6 limits) validates successfully. (8) Fuzz test: random buffers don't panic, either return Ok or specific error variant."
+          },
+          {
+            "id": 5,
+            "title": "Add comprehensive property-based tests and wire format examples",
+            "description": "Create tests/etherip_tests.rs with property-based tests using proptest for encode/decode roundtrip verification across all 4096 valid tunnel IDs, boundary condition tests, and documented wire format examples matching protocol specification",
+            "dependencies": [
+              2,
+              3,
+              4
+            ],
+            "details": "Create crates/eoip-proto/tests/etherip_tests.rs with: (1) Add dev-dependency in Cargo.toml: proptest = \"1\". (2) Import test targets: use eoip_proto::{encode_eoipv6_header, decode_eoipv6_header, validate_eoipv6_packet, MAX_EOIPV6_TUNNEL_ID}. (3) Property test using proptest macro: proptest! { #[test] fn roundtrip_all_tunnel_ids(tid in 0u16..=MAX_EOIPV6_TUNNEL_ID) { let mut buf = [0u8; 2]; encode_eoipv6_header(tid, &mut buf).unwrap(); let (decoded_tid, header_len) = decode_eoipv6_header(&buf).unwrap(); prop_assert_eq!(decoded_tid, tid); prop_assert_eq!(header_len, 2); } }. (4) Boundary tests: test_encode_tid_0, test_encode_tid_4095, test_encode_tid_4096_fails (verifies error). (5) Wire format examples matching docs/design/protocol.md: test_tid_300_wire_bytes verifying [0x13, 0x2C], test_tid_1000_wire_bytes verifying [0x33, 0xE8]. (6) Version rejection tests: test_decode_version_2_rejected, test_decode_version_4_rejected. (7) Integration test combining all functions: encode TID=500, decode it, create mock packet with header + 14-byte Ethernet frame, validate_eoipv6_packet returns Ok. (8) Negative test: validate_eoipv6_packet with 15-byte total buffer fails. (9) Add module doc comment explaining these tests verify bit-exact MikroTik EoIPv6 compatibility. (10) Run with 'cargo test -p eoip-proto --test etherip_tests' and verify all 4096 property test cases pass.",
+            "status": "pending",
+            "testStrategy": "Execute 'cargo test -p eoip-proto --test etherip_tests' and verify: (1) Property test runs 256+ cases (proptest default) covering TID range, all pass. (2) Boundary tests pass for TID=0, 4095, 4096 error. (3) Wire format tests exactly match [0x13,0x2C] and [0x33,0xE8]. (4) Version rejection tests confirm only 0x3 accepted. (5) Integration test validates complete encode→decode→validate flow. (6) Run 'cargo test -p eoip-proto' to ensure etherip module doesn't break existing tests. (7) Optional: run with PROPTEST_CASES=4096 to exhaustively test all valid TIDs. (8) Verify test execution time < 5 seconds for CI efficiency."
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Implement UDP shim header codec and complete protocol library",
+        "description": "Add UDP encapsulation shim for NAT traversal, finalize eoip-proto with comprehensive validation pipeline",
+        "details": "Create src/udp_shim.rs:\n- encode_udp_shim(inner_type: u8, buf: &mut [u8]): Write [0x45,0x4F,inner_type,0x00] where inner_type is 0x04 (EoIP) or 0x06 (EoIPv6)\n- decode_udp_shim(buf: &[u8]) -> Result<(u8 inner_type, usize shim_len), EoipError>: Validate magic [0x45,0x4F], type in [0x04,0x06], return type and offset 4\n\nUpdate lib.rs with validation pipeline helpers:\n- validate_and_parse_eoip(buf: &[u8]) combining header decode + validation\n- validate_and_parse_eoipv6(buf: &[u8])\n- validate_and_parse_udp_encap(buf: &[u8]) dispatching to inner validators\n\nAdd proptest in dev-dependencies. Write comprehensive docs/examples.",
+        "testStrategy": "Integration tests: parse UDP-wrapped EoIP (4B shim + 8B EoIP + 64B eth), parse UDP-wrapped EoIPv6. Validation pipeline tests with malformed packets (wrong magic, bad type, truncated). Fuzz testing with cargo-fuzz for 1000 random inputs",
+        "priority": "high",
+        "dependencies": [
+          2,
+          3
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Create udp_shim.rs module with constants and function signatures",
+            "description": "Create the src/udp_shim.rs file in eoip-proto crate with UDP shim magic bytes constant, inner type constants (0x04 for EoIP, 0x06 for EoIPv6), shim header length definition, and comprehensive documentation about NAT traversal UDP encapsulation format",
+            "dependencies": [],
+            "details": "Create crates/eoip-proto/src/udp_shim.rs with: (1) Module-level doc comment explaining UDP encapsulation is an EoIP-rs extension (NOT MikroTik-compatible) for NAT traversal, wrapping EoIP/EoIPv6 packets in UDP datagrams with 4-byte shim header [0x45,0x4F,type,0x00]. (2) Define public constants: pub const UDP_SHIM_MAGIC: [u8; 2] = [0x45, 0x4F]; (ASCII \"EO\"), pub const UDP_SHIM_HEADER_LEN: usize = 4;, pub const UDP_INNER_TYPE_EOIP: u8 = 0x04; (matches IP protocol 47 analogy), pub const UDP_INNER_TYPE_EOIPV6: u8 = 0x06; (matches IP protocol 97 analogy). (3) Add detailed comment explaining wire format: Byte 0-1: magic [0x45,0x4F], Byte 2: inner_type (0x04=EoIP with 8B header, 0x06=EoIPv6 with 2B header), Byte 3: reserved (0x00, must be zero on TX, ignored on RX). (4) Add function signatures: pub fn encode_udp_shim(inner_type: u8, buf: &mut [u8]) -> Result<(), EoipError>; pub fn decode_udp_shim(buf: &[u8]) -> Result<(u8, usize), EoipError>; (returns inner_type and shim_len=4). (5) Add use statement: use crate::error::EoipError;. (6) Document default UDP port 26969 in module doc comment (configurable by user). (7) Add wire format diagram showing complete UDP packet structure from protocol.md section 4.2.",
+            "status": "pending",
+            "testStrategy": "Verify module compiles with 'cargo check -p eoip-proto'. Write test confirming constants: UDP_SHIM_MAGIC == [0x45, 0x4F], UDP_SHIM_HEADER_LEN == 4, UDP_INNER_TYPE_EOIP == 0x04, UDP_INNER_TYPE_EOIPV6 == 0x06. Test that module is accessible from lib.rs after adding 'pub mod udp_shim;' declaration."
+          },
+          {
+            "id": 2,
+            "title": "Implement encode_udp_shim with type validation and fixed header write",
+            "description": "Implement the encode_udp_shim function that validates inner_type is either 0x04 (EoIP) or 0x06 (EoIPv6), checks buffer length, then writes 4-byte shim header with magic bytes, type field, and reserved byte",
+            "dependencies": [
+              1
+            ],
+            "details": "In encode_udp_shim function: (1) Validate inner_type is either UDP_INNER_TYPE_EOIP (0x04) or UDP_INNER_TYPE_EOIPV6 (0x06), return Err(EoipError::InvalidVersion{expected: 0x04 or 0x06, got: inner_type}) for any other value. This prevents accidentally encoding invalid type codes. (2) Check buf.len() >= 4, return Err(EoipError::PacketTooShort{got: buf.len(), need: 4}) if insufficient. (3) Write magic bytes at offset 0-1: buf[0..2].copy_from_slice(&UDP_SHIM_MAGIC);. (4) Write inner_type at offset 2: buf[2] = inner_type;. (5) Write reserved byte at offset 3: buf[3] = 0x00;. (6) Return Ok(()). (7) Add comprehensive doc comment with examples: inner_type=0x04 produces [0x45,0x4F,0x04,0x00] for UDP-wrapped EoIP, inner_type=0x06 produces [0x45,0x4F,0x06,0x00] for UDP-wrapped EoIPv6. (8) Add inline comment before reserved byte: // Reserved byte must be 0x00 on transmission per protocol spec. (9) Document that this function only writes the shim header - caller must write inner EoIP/EoIPv6 header plus Ethernet payload after offset 4.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) encode_udp_shim(0x04, &mut buf) produces [0x45,0x4F,0x04,0x00]. (2) encode_udp_shim(0x06, &mut buf) produces [0x45,0x4F,0x06,0x00]. (3) encode_udp_shim(0x99, &mut buf) returns InvalidVersion error (invalid type). (4) Buffer with len=3 returns PacketTooShort error. (5) Buffer exactly 4 bytes succeeds and writes complete shim. (6) Reserved byte is always 0x00 regardless of input."
+          },
+          {
+            "id": 3,
+            "title": "Implement decode_udp_shim with magic validation and type extraction",
+            "description": "Implement the decode_udp_shim function that validates buffer length, checks magic bytes [0x45,0x4F], verifies inner_type is valid (0x04 or 0x06), and returns the inner encapsulation type plus shim header length offset",
+            "dependencies": [
+              1
+            ],
+            "details": "In decode_udp_shim function: (1) Check buf.len() >= 4, return Err(EoipError::PacketTooShort{got: buf.len(), need: 4}) if insufficient. (2) Validate magic bytes: if &buf[0..2] != UDP_SHIM_MAGIC, return Err(EoipError::InvalidMagicBytes{expected: UDP_SHIM_MAGIC.to_vec(), got: buf[0..2].to_vec()}). This rejects non-EoIP-rs UDP packets. (3) Extract inner_type from byte 2: let inner_type = buf[2];. (4) Validate inner_type is either 0x04 or 0x06: if inner_type != UDP_INNER_TYPE_EOIP && inner_type != UDP_INNER_TYPE_EOIPV6, return Err(EoipError::InvalidVersion{expected: format!(\"0x04 or 0x06\"), got: inner_type}). This prevents processing unknown encapsulation formats. (5) Ignore reserved byte at buf[3] per spec (future compatibility). (6) Return Ok((inner_type, UDP_SHIM_HEADER_LEN)). The returned shim_len=4 tells caller where inner packet starts. (7) Add comprehensive doc comment explaining: return value (inner_type, offset_to_inner_packet), caller should then dispatch to eoip_proto::decode_eoip_header or decode_eoipv6_header based on inner_type. (8) Add example: [0x45,0x4F,0x04,0x00,...] returns (0x04, 4) indicating EoIP header starts at offset 4. (9) Add inline comment: // Reserved byte at buf[3] is ignored for forward compatibility with potential future extensions.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) decode_udp_shim([0x45,0x4F,0x04,0x00]) returns (0x04, 4). (2) decode_udp_shim([0x45,0x4F,0x06,0x00]) returns (0x06, 4). (3) Wrong magic [0x45,0x4E,0x04,0x00] returns InvalidMagicBytes error. (4) Invalid type [0x45,0x4F,0x99,0x00] returns InvalidVersion error. (5) Buffer with len=3 returns PacketTooShort error. (6) Reserved byte variations [0x45,0x4F,0x04,0xFF] still succeeds (ignored). (7) All valid combinations (magic correct, type 0x04/0x06) decode successfully."
+          },
+          {
+            "id": 4,
+            "title": "Implement validation pipeline helper functions in lib.rs",
+            "description": "Update crates/eoip-proto/src/lib.rs with high-level validation pipeline functions that combine decode + validation steps for each protocol mode: validate_and_parse_eoip, validate_and_parse_eoipv6, and validate_and_parse_udp_encap with inner protocol dispatching",
+            "dependencies": [
+              2,
+              3
+            ],
+            "details": "In crates/eoip-proto/src/lib.rs: (1) Import all codec modules: use gre::{decode_eoip_header, validate_eoip_packet}; use etherip::{decode_eoipv6_header, validate_eoipv6_packet}; use udp_shim::{decode_udp_shim, UDP_INNER_TYPE_EOIP, UDP_INNER_TYPE_EOIPV6};. (2) Implement pub fn validate_and_parse_eoip(buf: &[u8]) -> Result<(u16 tunnel_id, usize payload_offset), EoipError> that: calls validate_eoip_packet(buf, buf.len())?, then decode_eoip_header(buf)?, returns (tunnel_id, 8) for EoIP header length. Document this is for raw IP protocol 47 packets. (3) Implement pub fn validate_and_parse_eoipv6(buf: &[u8]) -> Result<(u16 tunnel_id, usize payload_offset), EoipError> that: calls validate_eoipv6_packet(buf, buf.len())?, then decode_eoipv6_header(buf)?, returns (tunnel_id, 2). Document this is for IPv6 protocol 97 packets. (4) Implement pub fn validate_and_parse_udp_encap(buf: &[u8]) -> Result<(u16 tunnel_id, usize payload_offset), EoipError> that: calls decode_udp_shim(buf)? to get (inner_type, shim_len), then matches on inner_type: if 0x04 calls validate_and_parse_eoip(&buf[4..])? and returns (tunnel_id, 4+8), if 0x06 calls validate_and_parse_eoipv6(&buf[4..])? and returns (tunnel_id, 4+2). Document this handles UDP-encapsulated packets and returns total offset to Ethernet payload. (5) Add module-level doc comment section \"# Validation Pipelines\" explaining these are convenience functions for RX path fast validation before demux. (6) Re-export udp_shim public types: pub use udp_shim::{UDP_SHIM_MAGIC, UDP_INNER_TYPE_EOIP, UDP_INNER_TYPE_EOIPV6, encode_udp_shim, decode_udp_shim};.",
+            "status": "pending",
+            "testStrategy": "Integration tests in tests/validation_pipeline.rs: (1) validate_and_parse_eoip with valid 8B header + 60B payload returns correct tunnel_id and offset 8. (2) validate_and_parse_eoipv6 with valid 2B header + 60B payload returns correct tunnel_id and offset 2. (3) validate_and_parse_udp_encap with 4B shim + 8B EoIP + 60B payload returns tunnel_id and offset 12. (4) validate_and_parse_udp_encap with 4B shim + 2B EoIPv6 + 60B payload returns tunnel_id and offset 6. (5) Malformed packets (wrong magic, truncated, invalid types) return appropriate errors. (6) Verify all functions fail fast on first validation error (don't process invalid data)."
+          },
+          {
+            "id": 5,
+            "title": "Add comprehensive integration tests and finalize eoip-proto documentation",
+            "description": "Create tests/udp_integration.rs with end-to-end tests for UDP-wrapped packets combining shim + inner headers + Ethernet payloads, add proptest dependency for fuzz testing, and finalize crate-level documentation with usage examples for all protocol modes",
+            "dependencies": [
+              4
+            ],
+            "details": "Create crates/eoip-proto/tests/udp_integration.rs with: (1) Test UDP-wrapped EoIP: construct packet with encode_udp_shim(0x04) + encode_eoip_header(tunnel_id=100, payload_len=64) + 64-byte Ethernet frame, verify validate_and_parse_udp_encap returns (100, 12), extract and verify Ethernet payload. (2) Test UDP-wrapped EoIPv6: construct with encode_udp_shim(0x06) + encode_eoipv6_header(tunnel_id=500) + 64-byte Ethernet frame, verify validate_and_parse_udp_encap returns (500, 6). (3) Negative tests: wrong magic in shim, invalid inner type (0x99), truncated shim (3 bytes), truncated inner header after valid shim, mismatched payload_len in EoIP variant. (4) Add proptest to Cargo.toml dev-dependencies: proptest = \"1\". (5) Write proptest fuzzing test in tests/fuzz_validation.rs: proptest! { #[test] fn fuzz_udp_packets(data in prop::collection::vec(any::<u8>(), 0..200)) { let _ = validate_and_parse_udp_encap(&data); // Should never panic } } running 1000 cases. (6) Update crates/eoip-proto/src/lib.rs crate doc with comprehensive examples section showing: basic EoIP encode/decode, EoIPv6 encode/decode, UDP-wrapped usage, validation pipeline usage. (7) Add \"# Protocol Modes\" section to crate doc listing all supported modes (A-F from protocol.md) with MTU implications. (8) Run 'cargo doc --open -p eoip-proto' and verify all modules have clean documentation with cross-references.",
+            "status": "pending",
+            "testStrategy": "Execute 'cargo test -p eoip-proto --test udp_integration' and verify: (1) UDP-wrapped EoIP test passes with correct tunnel_id and offset extraction. (2) UDP-wrapped EoIPv6 test passes. (3) All negative tests catch expected errors (InvalidMagicBytes, InvalidVersion, PacketTooShort). (4) Run 'cargo test -p eoip-proto --test fuzz_validation' with PROPTEST_CASES=1000 to verify no panics on random input. (5) Run full test suite 'cargo test -p eoip-proto' and verify all previous tests (gre, etherip, types, error, wire) still pass. (6) Verify documentation builds cleanly: 'cargo doc -p eoip-proto' shows no warnings. (7) Check rustdoc output includes working code examples with 'cargo test --doc -p eoip-proto'. (8) Integration smoke test: encode full UDP+EoIP+Ethernet packet, decode it, verify roundtrip extracts exact Ethernet payload."
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Build privileged helper binary with TAP creation and FD passing",
+        "description": "Implement eoip-helper for root-privileged resource creation, TAP interface setup via ioctl, raw socket creation, SCM_RIGHTS FD passing, and privilege dropping",
+        "details": "Create crates/eoip-helper with Cargo.toml deps: nix={version=\"0.29\", features=[\"net\",\"ioctl\",\"socket\",\"user\"]}, socket2={version=\"0.5\",features=[\"all\"]}, eoip-proto={path=\"../eoip-proto\"}, clap={version=\"4\",features=[\"derive\"]}.\n\nImplement:\n- src/tap.rs: create_tap_interface(name: &str) using nix::libc::ioctl with TUNSETIFF, IFF_TAP|IFF_NO_PI flags, return RawFd\n- src/rawsock.rs: create_raw_socket_v4() -> socket(AF_INET, SOCK_RAW, 47), create_raw_socket_v6() -> socket(AF_INET6, SOCK_RAW, 97) with proper error handling\n- src/fdpass.rs: send_fd_via_scm_rights(unix_sock: RawFd, fd_to_send: RawFd, msg: &HelperMsg) using nix::sys::socket::sendmsg with ControlMessage::ScmRights\n- src/privdrop.rs: drop_privileges(uid: u32, gid: u32) calling setgid/setuid after resource creation\n- src/main.rs: CLI with clap (#[command] mode: persist|exit, socket_path), main loop listening on Unix socket for DaemonMsg, handling CreateTunnel/Shutdown\n\nImplement MODE_PERSIST (stay alive for dynamic tunnels) vs MODE_EXIT (create all, exit).",
+        "testStrategy": "Integration test requiring root: create TAP, verify via `ip link show`, clean up. Mock tests for FD passing protocol. Privilege drop test: verify getuid()==target after drop. Error handling: invalid iface names, socket creation failures",
+        "priority": "high",
+        "dependencies": [
+          4
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Create eoip-helper crate structure with Cargo.toml and module skeleton",
+            "description": "Initialize the crates/eoip-helper directory with Cargo.toml configuration, create src/ subdirectory with main.rs and module files (tap.rs, rawsock.rs, fdpass.rs, privdrop.rs), and set up dependencies including nix, socket2, eoip-proto, and clap",
+            "dependencies": [],
+            "details": "Execute: mkdir -p crates/eoip-helper/src. Create crates/eoip-helper/Cargo.toml with [package] metadata (name=\"eoip-helper\", version.workspace=true, edition.workspace=true), [[bin]] section (name=\"eoip-helper\", path=\"src/main.rs\"), and [dependencies] section including nix={workspace=true, features=[\"net\",\"ioctl\",\"socket\",\"user\"]}, socket2={workspace=true, features=[\"all\"]}, eoip-proto={path=\"../eoip-proto\"}, clap={workspace=true, features=[\"derive\"]}. Create module files: src/tap.rs, src/rawsock.rs, src/fdpass.rs, src/privdrop.rs with module-level doc comments and use statements. In src/main.rs, add module declarations: mod tap; mod rawsock; mod fdpass; mod privdrop; Add use statements for clap::Parser, eoip_proto::wire::{HelperMsg, DaemonMsg}, std::os::unix::io::RawFd. Add top-level doc comment explaining this is the privileged helper binary for creating TAP interfaces and raw sockets that will be passed to unprivileged daemon via SCM_RIGHTS. Document security model: minimal code surface (~200 lines), no packet processing, drops privileges after resource creation.",
+            "status": "pending",
+            "testStrategy": "Verify workspace recognizes helper crate with 'cargo check -p eoip-helper' (will fail due to missing implementations but should parse successfully). Confirm directory structure with 'ls -R crates/eoip-helper/' showing Cargo.toml and all module files. Verify dependencies resolve correctly by checking 'cargo tree -p eoip-helper' shows nix 0.29, socket2 0.5, eoip-proto, clap 4."
+          },
+          {
+            "id": 2,
+            "title": "Implement TAP interface creation in src/tap.rs with ioctl TUNSETIFF",
+            "description": "Implement create_tap_interface function using nix::libc::ioctl with TUNSETIFF request, IFF_TAP|IFF_NO_PI flags to create TAP network interfaces and return the RawFd for FD passing",
+            "dependencies": [
+              1
+            ],
+            "details": "In crates/eoip-helper/src/tap.rs: (1) Import required items: use std::os::unix::io::{RawFd, AsRawFd}; use std::ffi::CString; use nix::libc::{ioctl, open, O_RDWR, IFF_TAP, IFF_NO_PI, TUNSETIFF, IFNAMSIZ}; use nix::errno::Errno; use eoip_proto::error::EoipError;. (2) Define ifreq struct matching Linux kernel layout: #[repr(C)] struct ifreq { ifr_name: [u8; IFNAMSIZ], ifr_flags: i16, _padding: [u8; 22] }. (3) Implement pub fn create_tap_interface(name: &str) -> Result<RawFd, EoipError> that: validates name.len() < IFNAMSIZ-1 (return TapError if too long), opens /dev/net/tun with O_RDWR (return TapError on failure), creates ifreq with name copied and ifr_flags = IFF_TAP | IFF_NO_PI, calls unsafe { ioctl(fd, TUNSETIFF, &ifreq) } (return TapError if -1), extracts actual interface name from ifreq.ifr_name (null-terminated), logs created interface name with tracing::info!, returns fd as RawFd. (4) Add comprehensive doc comment explaining TUNSETIFF creates virtual network device, IFF_TAP sets Layer 2 mode (Ethernet frames), IFF_NO_PI disables packet info header for performance. (5) Document that caller owns returned fd and must close it or pass to daemon. (6) Add helper function get_ifreq_name(ifreq: &ifreq) -> String to safely extract null-terminated name. (7) Add inline comments explaining kernel interface expectations and error conditions.",
+            "status": "pending",
+            "testStrategy": "Unit tests (require root or CAP_NET_ADMIN): (1) create_tap_interface(\"eoip0\") returns valid fd, verify with 'ip link show eoip0' (test must clean up via ioctl TUNSETIFF delete or ip link del). (2) Test with name exactly IFNAMSIZ-1 characters succeeds. (3) Test with name IFNAMSIZ characters returns TapError. (4) Test with empty name returns error. (5) Test without root returns permission denied TapError. (6) Integration test: create TAP, write raw Ethernet frame, verify readable from other end (requires root). Mock test: verify ifreq struct layout matches kernel with offset assertions. Document that full tests require root privileges or CI container with CAP_NET_ADMIN."
+          },
+          {
+            "id": 3,
+            "title": "Implement raw socket creation in src/rawsock.rs for IPv4/IPv6 protocols",
+            "description": "Implement create_raw_socket_v4 and create_raw_socket_v6 functions using socket2 crate to create raw sockets for IP protocol 47 (GRE/EoIP) and protocol 97 (EtherIP/EoIPv6) with proper error handling and socket option configuration",
+            "dependencies": [
+              1
+            ],
+            "details": "In crates/eoip-helper/src/rawsock.rs: (1) Import: use std::os::unix::io::{RawFd, IntoRawFd}; use socket2::{Socket, Domain, Type, Protocol}; use eoip_proto::error::EoipError;. (2) Implement pub fn create_raw_socket_v4() -> Result<RawFd, EoipError> that: creates Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(47)))? where 47 is GRE protocol number, maps socket2::Error to EoipError::RawSocketError via ?, sets socket options: set_nonblocking(true)? for async I/O compatibility, optionally set_reuse_address(true)? and set_reuse_port(true)? per design requirements, logs socket creation with tracing::info!(\"Created raw socket for IPv4 protocol 47 (EoIP)\"), returns socket.into_raw_fd(). (3) Implement pub fn create_raw_socket_v6() -> Result<RawFd, EoipError> that: creates Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::from(97)))? where 97 is EtherIP protocol number per RFC 3378, sets IPV6_V6ONLY socket option to true via set_only_v6(true)? to prevent IPv4-mapped IPv6 addresses, sets nonblocking(true), logs socket creation with tracing::info!(\"Created raw socket for IPv6 protocol 97 (EtherIP)\"), returns socket.into_raw_fd(). (4) Add comprehensive doc comments explaining: protocol 47 is GRE used for MikroTik EoIP over IPv4, protocol 97 is RFC 3378 EtherIP used for EoIPv6 over IPv6, raw sockets require CAP_NET_RAW capability or root, nonblocking mode required for tokio/async integration. (5) Document socket ownership transfer via into_raw_fd(). (6) Add error context with map_err to include protocol number in error messages.",
+            "status": "pending",
+            "testStrategy": "Unit tests (require root or CAP_NET_RAW): (1) create_raw_socket_v4() returns valid fd, verify socket exists via /proc/self/fd inspection. (2) create_raw_socket_v6() returns valid fd. (3) Test without CAP_NET_RAW returns permission denied error. (4) Verify nonblocking mode: attempt blocking read with timeout=0, should return EAGAIN immediately. (5) Verify IPV6_V6ONLY on v6 socket by attempting to bind IPv4-mapped address (should fail). (6) Integration test: create socket, bind to source IP, send crafted GRE packet, verify sendto() succeeds (requires root). (7) Test socket options are correctly set by reading back via getsockopt. Document tests require root or CI with CAP_NET_RAW. Mock tests verify error handling paths without requiring privileges."
+          },
+          {
+            "id": 4,
+            "title": "Implement FD passing via SCM_RIGHTS in src/fdpass.rs and privilege dropping in src/privdrop.rs",
+            "description": "Implement send_fd_via_scm_rights function using nix::sys::socket::sendmsg with ControlMessage::ScmRights to pass file descriptors over Unix domain sockets, and implement drop_privileges function calling setgid/setuid for security hardening after resource creation",
+            "dependencies": [
+              1
+            ],
+            "details": "In crates/eoip-helper/src/fdpass.rs: (1) Import: use std::os::unix::io::RawFd; use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags}; use nix::sys::uio::IoVec; use eoip_proto::wire::HelperMsg; use eoip_proto::error::EoipError;. (2) Implement pub fn send_fd_via_scm_rights(unix_sock: RawFd, fd_to_send: RawFd, msg: &HelperMsg) -> Result<(), EoipError> that: serializes msg using bincode::serialize (add bincode dev-dependency), creates IoVec::from_slice(&serialized_bytes), creates ControlMessage::ScmRights(&[fd_to_send]), calls sendmsg(unix_sock, &[iov], &[cmsg], MsgFlags::empty(), None)?, maps nix::Error to EoipError::HelperDisconnected, logs FD sent with tracing::debug!(\"Sent fd={fd_to_send} with message {msg:?}\"), returns Ok(()). (3) Add doc comment explaining SCM_RIGHTS is POSIX ancillary data mechanism for passing file descriptors between processes, kernel translates fd numbers during transfer, receiving process gets different fd number referencing same kernel object. Document message format: serialized HelperMsg in IoVec, fd in ancillary data. In crates/eoip-helper/src/privdrop.rs: (1) Import: use nix::unistd::{setgid, setuid, Gid, Uid, getuid, getgid}; use eoip_proto::error::EoipError;. (2) Implement pub fn drop_privileges(target_uid: u32, target_gid: u32) -> Result<(), EoipError> that: validates current uid == 0 (root) via getuid().is_root(), return error if not root, calls setgid(Gid::from_raw(target_gid))? first (GID must be dropped before UID per POSIX), then setuid(Uid::from_raw(target_uid))?, verifies drop succeeded: getuid() == target_uid && getgid() == target_gid, logs privilege drop with tracing::warn!(\"Dropped privileges to uid={target_uid} gid={target_gid}\"), returns Ok(()). (3) Add SECURITY comment explaining order matters: setgid before setuid, irreversible operation, verification required. (4) Document use case: MODE_PERSIST calls this after initial setup, MODE_EXIT doesn't need it (process exits).",
+            "status": "pending",
+            "testStrategy": "FD passing tests: (1) Create Unix socketpair, send dummy fd (e.g., open /dev/null), verify receiver gets valid fd via recvmsg with SCM_RIGHTS (requires separate recv implementation or mock). (2) Test serialization roundtrip: HelperMsg::TapCreated{iface_name:\"eoip0\".into(), tunnel_id:100} serializes and attaches to correct IoVec. (3) Test error handling: closed socket returns HelperDisconnected. Privilege drop tests (require root): (1) Start as root, drop_privileges(1000, 1000), verify getuid()==1000 && getgid()==1000. (2) Verify cannot regain root after drop (setuid(0) fails with EPERM). (3) Test calling drop_privileges when not root returns error. (4) Test wrong order (setuid before setgid in implementation) caught in code review. (5) Integration test: helper creates TAP as root, sends via SCM_RIGHTS, drops to user, attempts to create another TAP (should fail). Document root requirement for full test suite."
+          },
+          {
+            "id": 5,
+            "title": "Implement main.rs with CLI parsing, Unix socket listener, and MODE_PERSIST/MODE_EXIT logic",
+            "description": "Implement the main entry point with clap-based CLI argument parsing for --mode (persist|exit) and --socket-path, establish Unix domain socket connection with daemon, implement main loop listening for DaemonMsg commands (CreateTunnel, Shutdown), and coordinate resource creation with FD passing for both operational modes",
+            "dependencies": [
+              2,
+              3,
+              4
+            ],
+            "details": "In crates/eoip-helper/src/main.rs: (1) Define #[derive(Parser)] struct Args { #[arg(long, value_enum)] mode: Mode, #[arg(long, default_value=\"/var/run/eoip/helper.sock\")] socket_path: String }. (2) Define #[derive(ValueEnum, Clone)] enum Mode { Persist, Exit }. (3) In main() -> Result<(), EoipError>: parse Args via Args::parse(), initialize tracing_subscriber with env filter (RUST_LOG), log startup with info!(\"eoip-helper starting in {:?} mode\", args.mode), connect to Unix socket at args.socket_path using std::os::unix::net::UnixStream::connect()?, get unix_sock RawFd via as_raw_fd(). (4) Match on args.mode: For Mode::Exit: read initial config from socket (expect DaemonMsg), create all resources (TAP interfaces per config, raw sockets v4/v6), send each via send_fd_via_scm_rights with corresponding HelperMsg (TapCreated, RawSocket), send HelperMsg::HelperReady when done, exit process with std::process::exit(0). For Mode::Persist: send HelperMsg::HelperReady immediately, enter loop with nix::sys::socket::recvmsg to read DaemonMsg from unix_sock, match msg: DaemonMsg::CreateTunnel{iface_name, tunnel_id} => create_tap_interface(&iface_name)?, create raw sockets if first tunnel, send_fd_via_scm_rights(), DaemonMsg::Shutdown => break loop and exit cleanly. (5) Add comprehensive error handling: socket connection failures, ioctl failures, permission errors, serialize errors. (6) Add signal handlers for SIGTERM/SIGINT in PERSIST mode for clean shutdown. (7) Log all operations at appropriate levels: info for lifecycle events, debug for FD operations, error for failures. (8) Add doc comments explaining two modes: EXIT for static config (helper creates all, exits, minimal attack surface), PERSIST for dynamic tunnels (helper stays alive, responds to daemon requests, allows runtime tunnel addition). (9) Document that PERSIST mode should call drop_privileges after creating shared resources but validation shows this conflicts with per-tunnel TAP creation requiring root - note this design trade-off in comments.",
+            "status": "pending",
+            "testStrategy": "Integration tests (require root): (1) MODE_EXIT test: start helper, send mock config via Unix socket, verify receives TapCreated + RawSocket messages with valid fds, verify helper exits. (2) MODE_PERSIST test: start helper, send CreateTunnel message, verify receives TapCreated with valid fd, verify helper still running, send Shutdown, verify clean exit. (3) Test CLI parsing: --mode persist --socket-path /tmp/test.sock parses correctly. (4) Test socket connection failure (path doesn't exist) returns appropriate error. (5) Test invalid DaemonMsg in MODE_EXIT returns error. (6) Test signal handling: send SIGTERM in PERSIST mode, verify clean shutdown. (7) Stress test PERSIST mode: send 100 CreateTunnel requests sequentially, verify all succeed. (8) Test error recovery: CreateTunnel with invalid iface name, verify error response sent, helper remains operational. (9) End-to-end test: start helper and mock daemon on opposite ends of socketpair, create tunnel, verify fd transfer, verify TAP interface usable by daemon. Document tests require root and Unix socket mocking framework."
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Implement daemon core infrastructure with config, tunnel registry, and FD receiver",
+        "description": "Build eoip-rs daemon foundation: TOML config parsing, DashMap-based tunnel registry, FD receiver for helper integration, lifecycle state machine, graceful shutdown",
+        "details": "Create crates/eoip-rs with Cargo.toml workspace deps. Implement:\n- src/config.rs: #[derive(Deserialize)] structs for Config{daemon,api,logging,performance,tunnels}, TunnelConfig{tunnel_id,local,remote,iface_name,mtu,enabled,keepalive}, parse_config(path: &Path)\n- src/tunnel/registry.rs: TunnelRegistry wrapping DashMap<DemuxKey, Arc<TunnelHandle>>, methods insert/remove/get/iter\n- src/tunnel/handle.rs: TunnelHandle{tap_fd: Arc<AsyncFd<OwnedFd>>, stats: Arc<TunnelStats>, state: Arc<AtomicU8>, keepalive_tx}\n- src/tunnel/lifecycle.rs: TunnelState enum (Initializing=0, Configured=1, Active=2, Stale=3, TearingDown=4, Destroyed=5) with AtomicU8 backing\n- src/net/fdrecv.rs: recv_fd_via_scm_rights(unix_sock) returning (RawFd, HelperMsg) using nix::sys::socket::recvmsg\n- src/shutdown.rs: ShutdownCoordinator with tokio_util::sync::CancellationToken, signal handler for SIGTERM/SIGINT\n- src/main.rs: Load config, connect to helper socket, spawn FD receiver task, initialize TunnelRegistry\n\nUse tracing macros (info!, warn!, error!) throughout.",
+        "testStrategy": "Config parsing tests: valid TOML→struct, invalid→error. Registry concurrency test: 1000 parallel inserts/lookups. Lifecycle FSM test: valid transitions only. Shutdown test: CancellationToken triggers task cleanup. Mock helper socket for FD receiver",
+        "priority": "high",
+        "dependencies": [
+          5
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Create eoip-rs crate structure and implement TOML configuration parser",
+            "description": "Set up the crates/eoip-rs directory with Cargo.toml and implement src/config.rs with TOML deserialization for daemon configuration including tunnel definitions, API settings, logging, and performance parameters",
+            "dependencies": [],
+            "details": "Create crates/eoip-rs/Cargo.toml with workspace dependencies (tokio, serde, toml, tracing, dashmap, nix, crossbeam). Implement src/config.rs with: (1) Config struct containing daemon: DaemonConfig, api: ApiConfig, logging: LoggingConfig, performance: PerformanceConfig, tunnels: Vec<TunnelConfig>; (2) DaemonConfig with fields user, group, helper_mode (\"persist\"/\"exit\"), helper_socket (PathBuf), pid_file (PathBuf); (3) TunnelConfig with tunnel_id: u16, local: IpAddr, remote: IpAddr, iface_name: Option<String>, mtu: u16, enabled: bool, keepalive: KeepaliveConfig; (4) KeepaliveConfig with interval: Duration, timeout: Duration; (5) parse_config(path: &Path) -> Result<Config, ConfigError> function using toml::from_str. Add #[derive(Debug, Clone, Deserialize)] to all config structs. Use thiserror for ConfigError enum with variants for IoError, ParseError, ValidationError.",
+            "status": "pending",
+            "testStrategy": "Unit tests in src/config.rs: (1) parse_config with valid example TOML matching docs/design/architecture.md format, verify all fields deserialize correctly; (2) invalid TOML triggers ParseError; (3) missing required fields trigger appropriate errors; (4) tunnel_id > 4095 triggers ValidationError; (5) test with both IPv4 and IPv6 local/remote addresses; (6) verify Duration parsing from \"10s\", \"30s\" format works correctly"
+          },
+          {
+            "id": 2,
+            "title": "Implement tunnel lifecycle state machine and handle structures",
+            "description": "Create the tunnel state management infrastructure with atomic state transitions, tunnel handle wrapper containing TAP FD and stats, and lifecycle state enum matching the FSM specification",
+            "dependencies": [
+              1
+            ],
+            "details": "Implement src/tunnel/mod.rs as module root. Create src/tunnel/lifecycle.rs with: (1) TunnelState enum with variants Initializing = 0, Configured = 1, Active = 2, Stale = 3, TearingDown = 4, Destroyed = 5; (2) impl for TunnelState with to_u8() -> u8 and from_u8(u8) -> Option<Self>; (3) transition validation function is_valid_transition(from: TunnelState, to: TunnelState) -> bool implementing FSM from architecture.md. Create src/tunnel/handle.rs with: (1) TunnelHandle struct { tap_fd: Arc<AsyncFd<OwnedFd>>, stats: Arc<TunnelStats>, state: Arc<AtomicU8>, keepalive_tx: mpsc::Sender<KeepaliveEvent> }; (2) TunnelStats struct from eoip-proto types with AtomicU64 fields for rx_packets, rx_bytes, tx_packets, tx_bytes, rx_errors, tx_errors, last_rx: AtomicI64, last_tx: AtomicI64; (3) KeepaliveEvent enum for keepalive state machine messages. Use tokio::io::unix::AsyncFd and std::os::fd::OwnedFd.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) TunnelState roundtrip through to_u8/from_u8 for all variants; (2) is_valid_transition accepts Initializing→Configured, Configured→Active, Active→Stale, Stale→Active, Active→TearingDown, etc.; (3) is_valid_transition rejects invalid transitions like Destroyed→Active, Initializing→TearingDown; (4) TunnelStats atomic operations are Send+Sync verified via compilation; (5) verify AtomicU8 state can be loaded/stored correctly; (6) test concurrent stat updates from multiple threads using Arc<TunnelStats>"
+          },
+          {
+            "id": 3,
+            "title": "Implement DashMap-based tunnel registry with concurrent access patterns",
+            "description": "Build the TunnelRegistry structure wrapping DashMap for O(1) tunnel lookups by (tunnel_id, peer_addr) key with thread-safe insert/remove/get operations for the RX demux path",
+            "dependencies": [
+              2
+            ],
+            "details": "Create src/tunnel/registry.rs implementing: (1) TunnelRegistry struct wrapping DashMap<DemuxKey, Arc<TunnelHandle>> where DemuxKey is imported from eoip-proto::types; (2) impl TunnelRegistry with methods: new() -> Self, insert(key: DemuxKey, handle: Arc<TunnelHandle>) -> Option<Arc<TunnelHandle>>, remove(key: &DemuxKey) -> Option<Arc<TunnelHandle>>, get(key: &DemuxKey) -> Option<Arc<TunnelHandle>> using DashMap's get() which returns a reference guard, len() -> usize, iter() returning iterator over entries; (3) Add helper method find_by_tunnel_id(tid: u16) -> Vec<(DemuxKey, Arc<TunnelHandle>)> for listing all tunnels with given ID across different peers. Use dashmap::DashMap from workspace dependencies. Ensure all methods work correctly with Arc<TunnelHandle> to avoid cloning the underlying data. Add tracing::debug! logs for insert/remove operations.",
+            "status": "pending",
+            "testStrategy": "Concurrency test: spawn 1000 parallel tasks, half inserting random DemuxKey entries with unique (tunnel_id, IpAddr) pairs, half performing get() lookups, verify no panics and all inserts are retrievable. Collision test: insert same DemuxKey twice, verify second insert returns the old value. Iteration test: insert 100 entries, verify iter() yields all 100 with correct handles. Remove test: insert, then remove, verify get() returns None. find_by_tunnel_id test: insert tunnels with same tunnel_id but different peer IPs, verify all are found. Run tests with LOOM for memory ordering verification if feasible."
+          },
+          {
+            "id": 4,
+            "title": "Implement FD receiver using Unix domain socket SCM_RIGHTS for helper integration",
+            "description": "Create the file descriptor receiving infrastructure using SCM_RIGHTS ancillary messages to receive TAP and raw socket FDs from the privileged eoip-helper process over Unix domain sockets",
+            "dependencies": [
+              1
+            ],
+            "details": "Create src/net/mod.rs and src/net/fdrecv.rs implementing: (1) recv_fd_via_scm_rights(unix_sock: &UnixStream) -> Result<(RawFd, HelperMsg), FdRecvError> using nix::sys::socket::recvmsg with ControlMessageOwned::ScmRights parsing; (2) HelperMsg enum from eoip-proto wire protocol with variants TapCreated { iface_name: String, mtu: u16 }, RawSocketCreated { family: AddressFamily }, Error { message: String }; (3) Deserialize HelperMsg from the socket's regular data buffer (use bincode or similar); (4) Convert received RawFd to OwnedFd using std::os::fd::OwnedFd::from; (5) Error handling with FdRecvError enum covering socket errors, missing SCM_RIGHTS, invalid message format, helper errors. Add comprehensive tracing with info! when FD received, error! on failures. Use nix 0.29 from workspace dependencies with socket and user features.",
+            "status": "pending",
+            "testStrategy": "Mock integration test: create UnixStream pair via UnixStream::pair(), send SCM_RIGHTS message from one end with a dummy FD (e.g., /dev/null), verify recv_fd_via_scm_rights receives it correctly. HelperMsg deserialization test: serialize each HelperMsg variant, send over socket, verify correct deserialization. Error path test: call recv_fd_via_scm_rights on socket without SCM_RIGHTS, verify FdRecvError returned. Test with both TAP and raw socket message types. Note: Full end-to-end testing requires actual eoip-helper binary (deferred to integration tests)."
+          },
+          {
+            "id": 5,
+            "title": "Implement graceful shutdown coordinator and integrate main daemon entry point",
+            "description": "Build the shutdown coordination system using CancellationToken for signal propagation, implement signal handlers for SIGTERM/SIGINT, and create main.rs that initializes all components, loads config, connects to helper, and runs the daemon lifecycle",
+            "dependencies": [
+              3,
+              4
+            ],
+            "details": "Create src/shutdown.rs implementing: (1) ShutdownCoordinator struct { token: CancellationToken, shutdown_complete_tx: mpsc::Sender<()> } using tokio_util::sync::CancellationToken; (2) Methods: new() -> Self, shutdown_token() -> CancellationToken (clone of internal token), shutdown() triggering token.cancel(); (3) setup_signal_handlers(coordinator: Arc<ShutdownCoordinator>) spawning tokio task that awaits tokio::signal::ctrl_c() and signal::unix::signal(SignalKind::terminate()), calling coordinator.shutdown() on signal. Create src/main.rs with: (1) #[tokio::main] async fn main() -> Result<()>; (2) tracing_subscriber initialization with env filter from config.logging.level; (3) parse_config() from CLI args (use clap with --config flag); (4) Connect to helper socket at config.daemon.helper_socket using tokio::net::UnixStream; (5) Initialize TunnelRegistry; (6) Spawn FD receiver task in background; (7) Setup ShutdownCoordinator and signal handlers; (8) Create tokio::select! loop awaiting shutdown_token.cancelled(); (9) On shutdown, log graceful shutdown message, drop registry, wait for tasks. Use tracing macros throughout: info! for startup, warn! for signals, error! for failures.",
+            "status": "pending",
+            "testStrategy": "Shutdown token test: create ShutdownCoordinator, clone token, call shutdown(), verify token.is_cancelled() returns true. Signal handler test (requires tokio_test): send SIGTERM to test process, verify shutdown() is called (use mock or inspect logs). Integration test: run minimal main() with test config pointing to non-existent helper socket, verify graceful error handling and shutdown. Config loading test: create valid/invalid TOML files, verify main() handles both cases correctly. Verify tracing output contains expected log levels. Test that shutdown cancels spawned tasks correctly by creating a test task that awaits the cancellation token."
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Implement RX packet path with raw socket demultiplexing and TAP delivery",
+        "description": "Build high-performance RX pipeline: dedicated OS thread with recvmmsg, header parsing, DashMap-based demux, crossbeam channel to TAP writer, adaptive batching",
+        "details": "Implement:\n- src/packet/rx.rs: spawn_rx_worker_v4(raw_sock: RawFd, registry: Arc<TunnelRegistry>, buffer_pool) spawning std::thread with recvmmsg loop (batch size 64), parse headers via eoip_proto, lookup DemuxKey in registry, send to tunnel's crossbeam channel\n- spawn_rx_worker_v6 for IPv6/proto 97\n- Per-tunnel consumer task: recv from crossbeam::channel, write to TAP via AsyncFd<OwnedFd>, update stats.rx_packets/rx_bytes atomically\n- src/net/tap.rs: TapAsyncFd wrapping AsyncFd<OwnedFd> with async read/write methods\n- Buffer pool: crossbeam::queue::ArrayQueue<PacketBuf> where PacketBuf has 64B headroom + 1522B payload, impl Drop to return to pool\n\nUse nix::sys::socket::recvmmsg with iovec array. Handle EAGAIN gracefully. Log demux misses at INFO level with rate limiting (e.g., max 1/sec).",
+        "testStrategy": "Benchmark test: synthetic packet generator feeding raw socket, measure demux throughput (target 500K pps). Correctness test: send crafted EoIP packet, verify TAP receives exact Ethernet frame. Stress test: 100 concurrent tunnels, verify no drops. Buffer pool leak test: verify all buffers returned after 1M packets",
+        "priority": "high",
+        "dependencies": [
+          6
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Implement zero-copy buffer pool with PacketBuf and headroom management",
+            "description": "Create the buffer pool infrastructure using crossbeam::queue::ArrayQueue<PacketBuf> with 64-byte headroom + 1522-byte payload layout for zero-copy header prepending, implementing Drop trait for automatic buffer return",
+            "dependencies": [],
+            "details": "Create src/packet/mod.rs and src/packet/buffer.rs implementing: (1) PacketBuf struct with fields: data: Box<[u8]> (total size 1586 bytes = 64 headroom + 1522 max frame), head: usize (start of valid data), tail: usize (end of valid data), pool: Weak<BufferPool> (for Drop return). (2) BufferPool struct wrapping ArrayQueue<PacketBuf> with configurable pool size (default 4096 buffers based on performance.md formula: max(256, rx_batch_size * 4 + max_tunnels * 2)). (3) Methods: BufferPool::new(pool_size: usize) -> Arc<Self>, get() -> Option<PacketBuf> (pop from queue, reset head/tail), put(buf: PacketBuf) (push back to queue). (4) PacketBuf methods: payload_ptr() -> *mut u8 returning &mut data[head], capacity() -> usize returning tail-head, set_payload(offset: usize, len: usize) for setting valid data range after recvmmsg, prepend_header(header_len: usize) for TX path shifting head backward to write headers in headroom. (5) impl Drop for PacketBuf calling pool.upgrade().map(|p| p.put(self)) to return buffer on drop. (6) Constants: HEADER_HEADROOM = 64, MAX_FRAME_SIZE = 1522, BUF_TOTAL = 1586. Use crossbeam::queue::ArrayQueue for lock-free MPMC access. Add tracing::warn! when pool exhausted (drop packet rather than allocate). Document memory layout with ASCII diagram matching performance.md section 4.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) Create pool with size 16, get 16 buffers, verify 17th returns None (exhaustion). (2) Get buffer, drop it, verify returned to pool (get again succeeds). (3) Verify buffer layout: data.len() == 1586, initial head == 64, tail == 1586. (4) Test prepend_header: buf with head=64, prepend_header(8), verify head == 56. (5) Concurrency test: spawn 8 threads, each performing 10000 get/put cycles, verify no panics and final pool count == initial. (6) Memory leak test: create pool, perform 100000 get/drop cycles, verify pool size stable (no leaks). (7) Test payload_ptr points to correct offset in data array. Run with LOOM for memory ordering verification."
+          },
+          {
+            "id": 2,
+            "title": "Implement dedicated RX worker thread with recvmmsg batch receive loop",
+            "description": "Create spawn_rx_worker_v4 and spawn_rx_worker_v6 functions that spawn OS threads running tight recvmmsg loops (batch size 64) on raw sockets, parsing IP headers to extract source addresses and payloads for demultiplexing",
+            "dependencies": [
+              1
+            ],
+            "details": "Create src/packet/rx.rs with: (1) spawn_rx_worker_v4(raw_sock: RawFd, registry: Arc<TunnelRegistry>, buffer_pool: Arc<BufferPool>) -> JoinHandle<()> spawning std::thread::spawn (NOT tokio task) running rx_loop_v4. (2) rx_loop_v4 implementation: allocate stack arrays const BATCH: usize = 64; let mut iovecs: [iovec; BATCH], msgs: [mmsghdr; BATCH], addrs: [sockaddr_in; BATCH], pre-wire iovec→buffer, msghdr→iovec+addr per performance.md pseudocode. (3) Main loop: call nix::sys::socket::recvmmsg(raw_sock, &mut msgs, BATCH, MsgFlags::MSG_DONTWAIT, None), handle n <= 0 with EAGAIN using nix::poll::poll with POLLIN to wait for readability (avoid busy-wait), continue on other errors after logging. (4) Process received packets: for i in 0..n, extract len = msgs[i].msg_len, src_ip from addrs[i].sin_addr, parse IPv4 header to get ip_hdr_len = (buf.data[0] & 0x0F) * 4 (IP header IHL field), skip to GRE payload at offset ip_hdr_len. (5) Call eoip_proto::validate_and_parse_eoip(&buf.data[ip_hdr_len..]) to get (tunnel_id, payload_offset), construct DemuxKey { tunnel_id, peer_addr: IpAddr::V4(src_ip) }. (6) Lookup in registry.get(&key), on hit: extract Ethernet frame starting at ip_hdr_len + payload_offset, update buf.set_payload(), send to tunnel via handle.rx_tx.try_send(buf) (crossbeam bounded channel), on miss: log demux miss at INFO with rate limiting (e.g., std::sync::atomic counter + timestamp check, max 1/sec), drop packet. (7) Replenish consumed buffers from pool after each batch. (8) Implement spawn_rx_worker_v6 with same pattern using sockaddr_in6 and IPv6 header parsing (NextHeader field at offset 6, fixed 40-byte header), calling validate_and_parse_eoipv6. Use nix 0.29 recvmmsg API. Handle EWOULDBLOCK/EAGAIN gracefully with polling. Add tracing::error! for unexpected socket errors, tracing::info_span! for thread context.",
+            "status": "pending",
+            "testStrategy": "Mock socket test: create Unix socketpair as raw_fd substitute, send crafted EoIP packet matching protocol.md section 12.1 (TID=42, 64-byte frame), verify RX worker parses correctly and sends to mock channel. Batch test: send 64 packets rapidly, verify recvmmsg receives all in one syscall (check logs/instrumentation). Demux miss test: send packet with unknown tunnel_id, verify logged at INFO with correct rate limiting (send 1000 in 100ms, verify max ~100 log lines). IPv4 header parsing test: craft packets with IHL=5 (20 bytes) and IHL=15 (60 bytes with options), verify correct payload offset. Performance benchmark: synthetic packet generator feeding socketpair at 1 Mpps, measure RX worker throughput and CPU usage. Stress test: run 1M packets through worker, verify buffer pool stable (no leaks). Verify thread does not block tokio runtime."
+          },
+          {
+            "id": 3,
+            "title": "Implement per-tunnel TAP writer consumer tasks with AsyncFd integration",
+            "description": "Create spawn_tap_writer_task function that spawns tokio async tasks for each tunnel, receiving PacketBuf from crossbeam channel and writing Ethernet frames to TAP device via AsyncFd<OwnedFd>, updating RX statistics atomically",
+            "dependencies": [
+              1,
+              2
+            ],
+            "details": "In src/packet/rx.rs add: (1) spawn_tap_writer_task(tap_fd: Arc<AsyncFd<OwnedFd>>, rx_channel: crossbeam::channel::Receiver<PacketBuf>, stats: Arc<TunnelStats>, shutdown_token: CancellationToken) -> JoinHandle<Result<(), IoError>> spawning tokio::spawn async task. (2) Task loop: tokio::select! { _ = shutdown_token.cancelled() => break (graceful shutdown), buf = tokio::task::spawn_blocking(move || rx_channel.recv()) => process buffer }. Use spawn_blocking because crossbeam::Receiver::recv() is blocking and not async. (3) On buffer receive: loop { match tap_fd.writable().await { Ok(ready_guard) => { match ready_guard.try_io(|fd| { let n = nix::unistd::write(fd.as_raw_fd(), &buf.data[buf.head..buf.tail])?; Ok(n) }) { Ok(Ok(n)) => { stats.rx_packets.fetch_add(1, Ordering::Relaxed); stats.rx_bytes.fetch_add(n as u64, Ordering::Relaxed); stats.last_rx.store(now_millis(), Ordering::Relaxed); break; // success }, Ok(Err(e)) if e == Errno::EWOULDBLOCK => continue, // retry writable().await, Ok(Err(e)) => { stats.rx_errors.fetch_add(1, Ordering::Relaxed); tracing::warn!(\"TAP write error: {}\", e); break; // drop packet }, Err(_would_block) => continue, // AsyncFd not ready, retry } }, Err(e) => { tracing::error!(\"TAP AsyncFd error: {}\", e); break; } } }. (4) After write, drop(buf) returns buffer to pool automatically. (5) Helper function now_millis() -> i64 returning SystemTime::now().duration_since(UNIX_EPOCH).as_millis() as i64. (6) Use std::os::fd::AsRawFd to get RawFd from OwnedFd. Add comprehensive error handling for EAGAIN (queue full, TAP buffer full), EIO (TAP device gone - trigger tunnel teardown), ENOBUFS (drop and log). Update TunnelHandle in src/tunnel/handle.rs to include rx_channel: crossbeam::channel::Sender<PacketBuf> that RX worker sends to.",
+            "status": "pending",
+            "testStrategy": "Integration test: create mock TAP fd pair using Unix socketpair, spawn writer task, send PacketBuf via channel with known Ethernet frame, verify exact bytes written to socket. Statistics test: send 100 packets, verify stats.rx_packets == 100, rx_bytes == sum of frame sizes, last_rx timestamp updated. Error handling test: close TAP fd, send packet, verify rx_errors incremented and task doesn't panic. Backpressure test: fill TAP buffer (send large packets faster than consumed), verify EWOULDBLOCK handling with writable().await retry. Shutdown test: send cancellation token, verify task exits cleanly and remaining channel packets are drained or dropped. Channel capacity test: send 1000 packets to bounded channel (capacity 512), verify 488 dropped gracefully if RX thread overruns. Buffer return test: verify buffers returned to pool after write (check pool size before/after)."
+          },
+          {
+            "id": 4,
+            "title": "Create AsyncFd TAP device wrapper with async read/write methods",
+            "description": "Implement src/net/tap.rs with TapAsyncFd struct wrapping AsyncFd<OwnedFd> for TAP interfaces, providing async-friendly read/write methods for integration with tokio runtime while maintaining non-blocking semantics",
+            "dependencies": [],
+            "details": "Create src/net/tap.rs with: (1) TapAsyncFd struct { inner: AsyncFd<OwnedFd> } wrapping the TAP file descriptor in tokio's AsyncFd for epoll-based async I/O. (2) impl TapAsyncFd { pub fn new(fd: OwnedFd) -> io::Result<Self> creating AsyncFd::new(fd)? and returning Self { inner }. pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> that: loop { match self.inner.readable().await? { ready_guard => match ready_guard.try_io(|fd| nix::unistd::read(fd.as_raw_fd(), buf)) { Ok(Ok(n)) => return Ok(n), Ok(Err(e)) if e == Errno::EWOULDBLOCK => continue, // retry readable().await, Ok(Err(e)) => return Err(io::Error::from_raw_os_error(e as i32)), Err(_would_block) => continue, // AsyncFd not ready yet } } }. pub async fn write(&self, buf: &[u8]) -> io::Result<usize> with symmetric logic using writable().await and nix::unistd::write. pub fn into_shared(self) -> Arc<Self> wrapping in Arc for sharing across tasks. }. (3) Re-export in src/net/mod.rs as pub use tap::TapAsyncFd;. (4) Add comprehensive doc comments explaining AsyncFd provides async/await interface over non-blocking fd using epoll, IFF_NO_PI mode means read/write operate on raw Ethernet frames without packet info header. Document that read() may return frames up to MTU size (1500+14+4 = 1518 bytes typical, 1522 with VLAN tag). Add safety notes about OwnedFd ownership transfer.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) Create TapAsyncFd from mock fd (Unix socket), test read() with AsyncFd mocking. (2) Test write() similarly. (3) Test EWOULDBLOCK retry behavior by forcing writable()/readable() to return WouldBlock initially. Integration test (requires root): create real TAP device via eoip-helper, wrap in TapAsyncFd, write Ethernet frame, verify readable on other end via ip tuntap commands or tcpdump. Concurrency test: share Arc<TapAsyncFd> across 10 tasks, each reading/writing, verify no data corruption. Error test: close underlying fd, verify read/write return appropriate errors. Verify TapAsyncFd is Send+Sync (required for Arc across tasks)."
+          },
+          {
+            "id": 5,
+            "title": "Integrate RX pipeline components and add demux miss rate limiting",
+            "description": "Wire together buffer pool, RX worker threads, tunnel registry demux, and TAP writer tasks into complete RX pipeline, implement rate-limited logging for demux misses to prevent log spam under attack, and add comprehensive tracing instrumentation",
+            "dependencies": [
+              2,
+              3,
+              4
+            ],
+            "details": "In src/packet/rx.rs add: (1) pub fn start_rx_pipeline(raw_v4: RawFd, raw_v6: Option<RawFd>, registry: Arc<TunnelRegistry>, pool_size: usize, shutdown: CancellationToken) -> RxPipelineHandle that: creates BufferPool with pool_size, spawns spawn_rx_worker_v4(raw_v4, registry.clone(), pool.clone()), conditionally spawns spawn_rx_worker_v6 if IPv6 socket present, returns RxPipelineHandle { v4_thread: JoinHandle<()>, v6_thread: Option<JoinHandle<()>>, pool: Arc<BufferPool> } for lifecycle management. (2) Implement rate-limited demux miss logging: create static AtomicU64 last_log_time_ms and AtomicU64 miss_count_since_last_log, in demux miss path: increment miss_count, check if now_millis() - last_log_time_ms.load(Relaxed) > 1000 (1 second), if true: log at INFO level with tracing::info!(\"Demux misses: {} in last second\", miss_count_since_last_log.swap(0, Relaxed)), update last_log_time. This prevents log spam from floods while maintaining visibility. (3) Add tracing spans: instrument rx_loop_v4 with tracing::info_span!(\"rx_worker_v4\"), instrument each packet processing with tracing::trace_span!(\"process_packet\", tunnel_id = ?key.tunnel_id, src = ?key.peer_addr). Use tracing::instrument macro on functions. (4) Update TunnelRegistry integration: when tunnel is created, spawn spawn_tap_writer_task and store JoinHandle in TunnelHandle. When tunnel deleted, send shutdown to writer task via CancellationToken and await join. (5) Add graceful shutdown: RxPipelineHandle::shutdown(&self) sends shutdown signal to worker threads (use thread-safe channel or AtomicBool), awaits thread joins with timeout, logs any remaining packets in pool. (6) In src/main.rs integration: after receiving raw socket FDs from helper, call start_rx_pipeline and store handle for cleanup on shutdown. Document that RX workers are OS threads (not tokio tasks) to avoid blocking work-stealing scheduler, but TAP writers are tokio tasks for async I/O integration.",
+            "status": "pending",
+            "testStrategy": "End-to-end RX test: (1) Create test setup with mock raw sockets and TAP fds, populate TunnelRegistry with test tunnel, inject EoIP packets into raw socket, verify Ethernet frames appear on TAP fd with correct content. (2) Multi-tunnel test: register 10 tunnels with different (tunnel_id, peer_addr) keys, send 100 packets for each, verify all demuxed correctly. (3) Demux miss rate limiting test: send 10000 packets with unknown tunnel_id over 5 seconds, verify log output contains ~5 INFO messages (one per second) with cumulative miss counts. (4) Performance test: inject 500K pps using packet generator, measure throughput and verify target >500K pps from threading.md. (5) Shutdown test: start pipeline, send packets, trigger shutdown, verify threads join cleanly within 5 seconds. (6) Buffer pool test: run 1M packets through pipeline, verify pool size stable (all buffers returned). (7) Statistics validation: verify per-tunnel rx_packets/rx_bytes counters accurate across multiple tunnels. Run with tracing subscriber to verify instrumentation works. Run with valgrind or ASAN to detect memory leaks."
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Implement TX packet path with adaptive batching and raw socket sendmmsg",
+        "description": "Build TX pipeline: per-tunnel TAP reader tasks, header encoding with headroom, adaptive batching state machine, shared raw socket sendmmsg for high throughput",
+        "details": "Implement:\n- src/packet/tx.rs: spawn_tap_reader_task(tap_fd, tunnel_id, local_addr, remote_addr, tx_channel) using AsyncFd::readable(), read Ethernet frames, encode header into buffer headroom via eoip_proto::encode_*, send PacketBuf to batcher channel\n- src/packet/batch.rs: TxBatcher with adaptive FSM:\n  - State: Immediate (queue empty) vs Batching (accumulating)\n  - Immediate: sendto() single packet, transition to Batching if queue depth > low_water_mark (8)\n  - Batching: accumulate up to high_water_mark (256) or batch_timeout_us (50), then sendmmsg(), transition to Immediate if queue drains\n- spawn_tx_batcher_v4(raw_sock, rx_channel) and v6 variant\n- Use nix::sys::socket::sendmmsg with iovec array, handle EAGAIN/ENOBUFS by dropping packet and incrementing tx_errors\n\nPre-allocate mmsghdr arrays. Use tokio::time::timeout for batch flush.",
+        "testStrategy": "Latency test: single packet, verify <150us RX→TX (Immediate mode). Throughput test: iperf3 TCP, verify adaptive batching achieves 3+ Gbps. Batch FSM test: monitor state transitions under varying load. ENOBUFS handling: verify graceful degradation under socket buffer pressure",
+        "priority": "high",
+        "dependencies": [
+          7
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Implement PacketBuf structure with headroom-based buffer allocation",
+            "description": "Create the PacketBuf type in src/packet/mod.rs with pre-allocated headroom for zero-copy header insertion, integrated with crossbeam ArrayQueue-based buffer pool",
+            "dependencies": [],
+            "details": "In crates/eoip-rs/src/packet/mod.rs: Define struct PacketBuf { data: Box<[u8]>, head: usize, tail: usize, pool: Arc<BufferPool> } with constants HEADER_HEADROOM=64, MAX_FRAME_SIZE=1522, BUF_TOTAL=1586. Implement methods: new() initializing with head=HEADER_HEADROOM, tail=HEADER_HEADROOM; payload_slice() returning &[u8] from head..tail; prepend_header(size: usize) decrementing head and returning mutable slice for header writes; set_payload(offset: usize, len: usize) for RX path. Implement Drop trait returning buffer to pool.pool.push(). Define struct BufferPool { pool: crossbeam::queue::ArrayQueue<PacketBuf>, buf_size: usize } with get() -> Option<PacketBuf> popping from queue, and sizing formula: pool_count = max(256, 64*4 + max_tunnels*2). Document memory layout in doc comments with ASCII diagram showing [headroom|payload|unused] regions and how head pointer moves left during header prepend.",
+            "status": "pending",
+            "testStrategy": "Unit tests: (1) Verify buffer allocation initializes with head=64, tail=64, data.len()=1586. (2) Test prepend_header(8) decrements head to 56 and returns 8-byte mutable slice. (3) Test buffer pool exhaustion returns None without panicking. (4) Verify Drop returns buffer to pool by get()->drop->get() cycle. (5) Multi-threaded test with 4 threads getting/returning buffers verifies lock-free pool works correctly."
+          },
+          {
+            "id": 2,
+            "title": "Implement per-tunnel TAP reader task with AsyncFd integration",
+            "description": "Create spawn_tap_reader_task in src/packet/tx.rs that spawns a tokio task per tunnel to read Ethernet frames from TAP fd using AsyncFd::readable(), encode headers via eoip_proto::encode_*, and send to batcher channel",
+            "dependencies": [
+              1
+            ],
+            "details": "In crates/eoip-rs/src/packet/tx.rs: Implement pub async fn spawn_tap_reader_task(tap_fd: Arc<AsyncFd<OwnedFd>>, tunnel_id: u16, local_addr: IpAddr, remote_addr: IpAddr, tx_channel: crossbeam::channel::Sender<PacketBuf>, buffer_pool: Arc<BufferPool>) -> JoinHandle<()>. Inside spawned task: loop { tap_fd.readable().await?; let mut buf = buffer_pool.get().ok_or_continue(); let n = tap_fd.read(&mut buf.data[HEADER_HEADROOM..])? handling EAGAIN; if n < 14 { continue; /* too short */ } buf.set_payload(HEADER_HEADROOM, n); match local_addr { IpAddr::V4(_) => { buf.prepend_header(8); eoip_proto::gre::encode_eoip_header(tunnel_id, n as u16, &mut buf.payload_slice())?; }, IpAddr::V6(_) => { buf.prepend_header(2); eoip_proto::etherip::encode_eoipv6_header(tunnel_id, &mut buf.payload_slice())?; } }; tx_channel.try_send(buf).unwrap_or_else(|_| stats.tx_errors.fetch_add(1)); }. Handle AsyncFd registration errors. Add tracing::trace! for frame reads (disabled by default).",
+            "status": "pending",
+            "testStrategy": "Integration test: Create mock TAP fd using pty/pipe, write synthetic 64-byte Ethernet frame, verify spawn_tap_reader_task reads it and encodes correct EoIP header (magic [0x20,0x01,0x64,0x00] + payload_len=64 BE + tunnel_id LE). Verify buffer headroom is correctly used (head pointer at 56 for 8B GRE, at 62 for 2B EtherIP). Latency test: measure time from write to channel send, target <50us. Error test: verify EAGAIN handled without panicking, verify short frames (<14B) skipped."
+          },
+          {
+            "id": 3,
+            "title": "Implement adaptive batching state machine in TxBatcher",
+            "description": "Create src/packet/batch.rs implementing TxBatcher with bimodal FSM: Immediate mode (sendto single packet) when queue empty, Batching mode (accumulate + sendmmsg) when queue depth exceeds low_water_mark, with configurable thresholds",
+            "dependencies": [
+              1
+            ],
+            "details": "In crates/eoip-rs/src/packet/batch.rs: Define struct BatchConfig { low_water_mark: usize=8, high_water_mark: usize=256, batch_timeout_us: u64=50 }. Define enum BatchState { Immediate, Batching { batch: ArrayVec<(SocketAddr, PacketBuf), 256>, flush_deadline: Instant } }. Implement struct TxBatcher { state: BatchState, raw_sock: RawFd, config: BatchConfig, stats: Arc<AtomicU64> }. Implement fn process_packet(&mut self, pkt: PacketBuf, remote: SocketAddr, queue_depth: usize) -> Action { match self.state { Immediate if queue_depth <= low_water_mark => sendto_single(pkt), Immediate if queue_depth > low_water_mark => transition to Batching, accumulate pkt, Batching => accumulate pkt; if batch.len() >= high_water_mark { FlushNow } else if queue_depth > 32 { tighten deadline to 10us } else { Wait } } }. Define enum Action { FlushNow, Wait }. Implement flush() calling nix::sys::socket::sendmmsg with iovec array built from batch. Add #[inline] hints on hot path functions.",
+            "status": "pending",
+            "testStrategy": "State machine test: (1) Verify initial state is Immediate. (2) Send packet with queue_depth=0, verify immediate sendto() called. (3) Send packets with queue_depth=16, verify transition to Batching after low_water_mark. (4) Accumulate 256 packets, verify sendmmsg() called. (5) Test deadline tightening: queue_depth=64 should set 10us deadline vs 50us default. (6) Verify batch resets to Immediate after flush completes. Benchmark: verify Immediate mode adds <100us latency, Batching mode achieves >3Gbps with iperf3."
+          },
+          {
+            "id": 4,
+            "title": "Implement spawn_tx_batcher tasks for IPv4 and IPv6",
+            "description": "Create spawn_tx_batcher_v4 and spawn_tx_batcher_v6 functions in src/packet/batch.rs that spawn dedicated tokio tasks consuming from crossbeam channel, running TxBatcher FSM, and calling sendmmsg on shared raw socket",
+            "dependencies": [
+              2,
+              3
+            ],
+            "details": "In crates/eoip-rs/src/packet/batch.rs: Implement pub fn spawn_tx_batcher_v4(raw_sock: RawFd, rx_channel: crossbeam::channel::Receiver<(SocketAddr, PacketBuf)>, config: BatchConfig) -> JoinHandle<()> { tokio::spawn(async move { let mut batcher = TxBatcher::new(raw_sock, config); loop { tokio::select! { Ok((addr, pkt)) = async { rx_channel.recv() } => { let queue_depth = rx_channel.len(); match batcher.process_packet(pkt, addr, queue_depth) { Action::FlushNow => batcher.flush()?, Action::Wait => {} } }, _ = tokio::time::sleep_until(batcher.flush_deadline()), if batcher.has_pending() => { batcher.flush()?; } } } }) }. Implement spawn_tx_batcher_v6 identically but type-hinted for IPv6 SocketAddr. Use tokio::select! for timeout-driven flushes. Handle EAGAIN/ENOBUFS from sendmmsg by dropping packets and incrementing stats.tx_errors. Implement sendmmsg wrapper using nix::sys::socket::sendmmsg with pre-allocated mmsghdr array (reused across calls).",
+            "status": "pending",
+            "testStrategy": "Integration test: (1) Create test raw socket, spawn batcher, send 10 packets via channel, verify sendmmsg called. (2) Send single packet with empty queue, verify sendto() path used (Immediate mode). (3) Send 300 packets rapidly, verify batching triggers at low_water_mark=8. (4) Test timeout: send 5 packets, wait 60us, verify flush triggered by deadline. (5) ENOBUFS test: fill socket buffer, verify graceful degradation (packets dropped, tx_errors incremented, no panic). (6) Benchmark: 4 tunnels sending simultaneously, verify >5Gbps aggregate throughput with iperf3."
+          },
+          {
+            "id": 5,
+            "title": "Integrate TX pipeline components with TunnelManager and implement error handling",
+            "description": "Wire up TAP reader tasks and TX batchers in TunnelManager, implement graceful error handling (ENOBUFS, EAGAIN, EMSGSIZE), add per-tunnel stats tracking, and create end-to-end TX path from TAP read to sendmmsg",
+            "dependencies": [
+              4
+            ],
+            "details": "In crates/eoip-rs/src/tunnel/mod.rs: Modify TunnelManager to spawn per-tunnel TAP readers during tunnel creation via spawn_tap_reader_task(). Create shared v4/v6 batcher channels: let (v4_tx, v4_rx) = crossbeam::channel::bounded(1024); spawn_tx_batcher_v4(raw_sock_v4, v4_rx, config.batch_config). Store batcher channel senders in TunnelHandle. In TAP reader, send (remote_addr, packet_buf) tuples to appropriate batcher channel. Implement error handling: (1) EMSGSIZE from sendmmsg → log warning with tunnel_id and MTU suggestion, increment tx_errors. (2) ENOBUFS → drop packet silently, increment tx_errors (backpressure). (3) TAP read EIO → tear down tunnel, log critical error. Add metrics: stats.tx_packets.fetch_add(1, Ordering::Relaxed) in batcher after successful sendmmsg. Add stats.last_tx_timestamp.store(now_millis(), Ordering::Relaxed). Create src/packet/mod.rs with pub mod tx; pub mod batch; pub use batch::BatchConfig;. Add tracing::debug! for state transitions (rate-limited to 1/sec). Add graceful shutdown: on CancellationToken signal, abort TAP reader tasks, flush batchers, close channels.",
+            "status": "pending",
+            "testStrategy": "End-to-end test: (1) Create tunnel with test TAP fd, write 100 Ethernet frames to TAP, verify all received at mock peer socket with correct EoIP headers. (2) Verify stats: tx_packets==100, tx_bytes==total, last_tx_timestamp within 100ms. (3) MTU test: write 1600-byte frame (exceeds 1500 MTU), verify EMSGSIZE error, tx_errors incremented, frame not sent. (4) Graceful shutdown test: trigger shutdown token, verify TAP tasks abort cleanly, batchers flush pending packets, no panics. (5) Performance test: 100 tunnels, iperf3 across all, verify aggregate >8Gbps on jumbo frames, >3Gbps on 1500 MTU. Verify CPU usage <25% per Gbps with perf stat."
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Build gRPC management API with streaming tunnel events",
+        "description": "Implement eoip-api protobuf definitions and eoip-rs gRPC server for TunnelService (CRUD, WatchTunnels), StatsService, HealthService using tonic",
+        "details": "Create crates/eoip-api:\n- proto/eoip.proto: Define messages (Tunnel, TunnelStats, TunnelEvent, CreateTunnelRequest/Response, etc.) and services per architecture.md spec\n- build.rs: tonic_build::compile_protos([\"proto/eoip.proto\"])\n- src/lib.rs: Re-export generated eoip::v1::*\n\nIn eoip-rs:\n- src/api/tunnel_svc.rs: impl TunnelService for TunnelServiceImpl wrapping Arc<TunnelRegistry>, CreateTunnel sends DaemonMsg to helper, inserts into registry; DeleteTunnel removes; WatchTunnels uses tokio::sync::broadcast for event streaming\n- src/api/stats_svc.rs: impl StatsService reading from TunnelStats atomics\n- src/api/health_svc.rs: impl HealthService checking helper connection\n- src/api/mod.rs: tonic::transport::Server builder with reflection, bind to config.api.listen\n\nIntegrate into main: spawn gRPC server task alongside packet processing.",
+        "testStrategy": "Integration test with tonic client: CreateTunnel, verify appears in ListTunnels, send packet via TAP, GetStats shows incremented counters, DeleteTunnel removes. WatchTunnels streaming test: create/delete tunnels, verify events received. Health check returns SERVING when helper connected",
+        "priority": "medium",
+        "dependencies": [
+          8
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Create eoip-api crate with protobuf definitions",
+            "description": "Set up eoip-api crate structure with proto file defining TunnelService, StatsService, and HealthService with all messages",
+            "dependencies": [],
+            "details": "Create crates/eoip-api directory structure with Cargo.toml (dependencies: tonic=0.12, prost=0.13, tonic-build=0.12). Create proto/eoip.proto with package eoip.v1; define messages: Tunnel (tunnel_id, local_addr, remote_addr, iface_name, mtu, state, stats), TunnelStats (tx_packets, tx_bytes, rx_packets, rx_bytes, tx_errors, rx_errors, last_rx_ms, last_tx_ms), TunnelState enum (UNSPECIFIED=0, INITIALIZING=1, CONFIGURED=2, ACTIVE=3, STALE=4, TEARING_DOWN=5), TunnelEvent with EventType enum, CreateTunnelRequest/Response, DeleteTunnelRequest/Response, ListTunnelsRequest/Response, GetTunnelRequest, WatchTunnelsRequest, GetStatsRequest, GetGlobalStatsRequest, GlobalStats, HealthCheckRequest/Response with ServingStatus enum. Create build.rs with fn main() calling tonic_build::compile_protos(&[\"proto/eoip.proto\"], &[\"proto/\"]).unwrap(). Create src/lib.rs re-exporting pub use eoip::v1::*; and pub mod eoip { pub mod v1 { tonic::include_proto!(\"eoip.v1\"); } }.",
+            "status": "pending",
+            "testStrategy": "Run cargo build in eoip-api crate to verify proto compilation. Check that generated code includes tunnel_service_server::TunnelService, stats_service_server::StatsService, health_service_server::HealthService traits and all message types are accessible."
+          },
+          {
+            "id": 2,
+            "title": "Implement TunnelService gRPC server with CRUD operations",
+            "description": "Build TunnelServiceImpl wrapping Arc<TunnelRegistry> with CreateTunnel, DeleteTunnel, ListTunnels, GetTunnel RPCs",
+            "dependencies": [
+              1
+            ],
+            "details": "In eoip-rs crate, create src/api/tunnel_svc.rs with pub struct TunnelServiceImpl { registry: Arc<TunnelRegistry>, helper_tx: mpsc::Sender<DaemonMsg> }. Implement #[tonic::async_trait] impl tunnel_service_server::TunnelService for TunnelServiceImpl: async fn create_tunnel validates tunnel_id (1-4095), sends DaemonMsg::CreateTunnel to helper via helper_tx, inserts TunnelHandle into registry.insert(DemuxKey{tunnel_id, peer_addr}), returns CreateTunnelResponse with created Tunnel message. async fn delete_tunnel removes from registry, sends DaemonMsg::DestroyTunnel, returns success. async fn list_tunnels iterates registry, maps TunnelHandle to Tunnel proto messages. async fn get_tunnel does registry.get(key), returns single Tunnel or NotFound status. Handle errors with tonic::Status conversions (InvalidArgument, NotFound, Internal).",
+            "status": "pending",
+            "testStrategy": "Unit test with mock registry: call create_tunnel with valid request, verify registry.get returns handle. Integration test: start gRPC server, use tonic client to CreateTunnel with tunnel_id=300, verify ListTunnels includes it, GetTunnel returns same data, DeleteTunnel removes it."
+          },
+          {
+            "id": 3,
+            "title": "Implement WatchTunnels streaming RPC with broadcast channel",
+            "description": "Add event streaming to TunnelService using tokio::sync::broadcast for real-time tunnel state changes",
+            "dependencies": [
+              2
+            ],
+            "details": "In tunnel_svc.rs, add event_tx: broadcast::Sender<TunnelEvent> to TunnelServiceImpl constructor. Implement async fn watch_tunnels(&self, request: WatchTunnelsRequest) -> Result<Response<impl Stream<Item=Result<TunnelEvent, Status>>>, Status>: subscribe to broadcast channel via event_rx = self.event_tx.subscribe(), wrap in ReceiverStream::new converting broadcast::Receiver to Stream, map broadcast errors to tonic::Status. In TunnelRegistry or TunnelManager integration points (create_tunnel, delete_tunnel, state transitions), publish events: event_tx.send(TunnelEvent { event_type: CREATED/DELETED/STATE_CHANGED, tunnel: ... }).ok(). Handle client disconnects gracefully (drop receiver). Support initial snapshot: optionally send current tunnels before streaming updates based on WatchTunnelsRequest.send_initial_state flag.",
+            "status": "pending",
+            "testStrategy": "Integration test: create WatchTunnels stream, in parallel create tunnel via CreateTunnel RPC, verify stream receives CREATED event within 100ms. Delete tunnel, verify DELETED event. Test multiple concurrent watchers receive same events. Test client disconnect doesn't crash server."
+          },
+          {
+            "id": 4,
+            "title": "Implement StatsService and HealthService gRPC servers",
+            "description": "Build StatsServiceImpl reading from TunnelStats atomics and HealthServiceImpl checking helper connection",
+            "dependencies": [
+              1
+            ],
+            "details": "Create src/api/stats_svc.rs with pub struct StatsServiceImpl { registry: Arc<TunnelRegistry> }. Implement stats_service_server::StatsService: async fn get_stats(tunnel_id) does registry lookup, reads stats.tx_packets.load(Ordering::Relaxed) etc., maps to TunnelStats proto. async fn get_global_stats aggregates across all tunnels using registry.iter(), sums counters, returns GlobalStats. Create src/api/health_svc.rs with pub struct HealthServiceImpl { helper_connected: Arc<AtomicBool> }. Implement health_service_server::HealthService: async fn check returns HealthCheckResponse with status=SERVING if helper_connected.load(Ordering::Acquire)==true, else NOT_SERVING. Helper connection state updated by FD receiver task. Follow gRPC health checking protocol specification.",
+            "status": "pending",
+            "testStrategy": "Stats test: create tunnel, increment stats.tx_packets manually, call GetStats RPC, verify returned value matches. Global stats test: create 3 tunnels with different counters, verify sum is correct. Health test: set helper_connected=true, verify Check returns SERVING; set false, verify NOT_SERVING."
+          },
+          {
+            "id": 5,
+            "title": "Integrate gRPC server into main runtime with reflection",
+            "description": "Create src/api/mod.rs building tonic::transport::Server, bind to config.api.listen, spawn alongside packet processing",
+            "dependencies": [
+              2,
+              3,
+              4
+            ],
+            "details": "Create src/api/mod.rs declaring mod tunnel_svc; mod stats_svc; mod health_svc;. Implement pub async fn serve_grpc(config: &ApiConfig, registry: Arc<TunnelRegistry>, helper_tx: mpsc::Sender<DaemonMsg>, helper_connected: Arc<AtomicBool>, event_tx: broadcast::Sender<TunnelEvent>) -> Result<(), Box<dyn Error>>: build services via TunnelServiceImpl::new(), StatsServiceImpl::new(), HealthServiceImpl::new(). Use tonic::transport::Server::builder().add_service(tunnel_service_server::TunnelServiceServer::new(tunnel_svc)).add_service(stats_service_server::StatsServiceServer::new(stats_svc)).add_service(health_service_server::HealthServiceServer::new(health_svc)).add_service(tonic_reflection::server::Builder::configure().register_encoded_file_descriptor_set(eoip_api::FILE_DESCRIPTOR_SET).build()?).serve(config.listen.parse()?). In src/main.rs, spawn tokio::spawn(api::serve_grpc(...)) alongside packet processing tasks. Handle graceful shutdown via CancellationToken: server.serve_with_shutdown(addr, shutdown_rx.recv()).",
+            "status": "pending",
+            "testStrategy": "End-to-end integration test: start full daemon with config.api.listen=\"127.0.0.1:50051\", use grpcurl or tonic client to list services (verify reflection works), call TunnelService/ListTunnels, StatsService/GetGlobalStats, HealthService/Check. Verify all respond successfully. Test graceful shutdown: send SIGTERM, verify server stops accepting requests and completes in-flight RPCs within 5s."
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Implement keepalive state machine and end-to-end integration testing",
+        "description": "Add keepalive protocol (zero-payload packets), stale detection/recovery FSM, integrate all components, write E2E tests including MikroTik interop validation",
+        "details": "Implement:\n- src/keepalive.rs: KeepaliveManager spawning per-tunnel tasks with tokio::time::interval(config.keepalive.interval), sending zero-payload EoIP packets via TX path, tracking last_rx timestamp from stats, transitioning state to Stale after timeout, back to Active on RX resume\n- Update RX path to accept payload_len=0 packets without TAP delivery\n- Integration into tunnel lifecycle: Active spawns keepalive task, Stale stops TX but keeps RX demux entry\n\nE2E tests:\n- tests/integration/eoip_pair.rs: Create two tunnels, send crafted Ethernet frames, verify delivery\n- tests/interop/mikrotik_compat.rs: Load pcap of MikroTik EoIP packets, parse with eoip-proto, verify exact byte match on encode\n- tests/perf/throughput.rs: Criterion benchmark with iperf3, assert >3 Gbps TCP throughput\n- tests/perf/latency.rs: Ping test, assert p99 <500us under load\n\nAdd config/eoip-rs.example.toml, systemd/*.service files, README.md with quick-start.",
+        "testStrategy": "Keepalive test: disable RX, verify Stale after timeout, resume RX, verify Active recovery. MikroTik interop: byte-exact comparison with reference captures. Stress test: 100 tunnels, 1M packets, verify no leaks (valgrind/ASAN). CI: GitHub Actions matrix (Linux stable/nightly, clippy, fmt, tests, benchmarks)",
+        "priority": "medium",
+        "dependencies": [
+          9
+        ],
+        "status": "pending",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Implement keepalive manager module with per-tunnel state tracking",
+            "description": "Create src/keepalive.rs with KeepaliveManager that spawns per-tunnel tasks to send zero-payload EoIP packets at configured intervals and track tunnel health state transitions",
+            "dependencies": [],
+            "details": "Implement KeepaliveManager in crates/eoip-rs/src/keepalive.rs:\n- Define KeepaliveState enum: Active, Stale with atomic transitions\n- spawn_keepalive_task(tunnel_handle, config) function spawning tokio task with tokio::time::interval(config.keepalive.interval)\n- Send zero-payload packets via TX path: payload_len=0 for EoIP (8 bytes total), 2 bytes for EoIPv6\n- Track last_rx timestamp from TunnelStats.last_rx (AtomicI64)\n- Transition to Stale when current_time - last_rx > config.keepalive.timeout\n- Transition back to Active on RX resume (last_rx updates)\n- Cancel task on tunnel teardown using CancellationToken\n- Use tracing for state transitions with tunnel_id context",
+            "status": "pending",
+            "testStrategy": "Unit tests: verify zero-payload packet encoding matches protocol spec ([0x20,0x01,0x64,0x00,0x00,0x00,TID_lo,TID_hi]). Mock time tests: verify Stale transition after timeout. State transition tests: Active→Stale→Active roundtrip. Cancellation test: verify task cleanup on tunnel destroy"
+          },
+          {
+            "id": 2,
+            "title": "Update RX packet path to handle zero-payload keepalive packets",
+            "description": "Modify RX demultiplexing logic in crates/eoip-rs/src/packet/rx.rs to accept and process zero-payload packets without delivering to TAP interface",
+            "dependencies": [
+              1
+            ],
+            "details": "Update spawn_rx_worker_v4 and spawn_rx_worker_v6 in crates/eoip-rs/src/packet/rx.rs:\n- After header decode, check payload_len field (EoIP) or computed frame length (EoIPv6)\n- If payload_len == 0: update stats.last_rx timestamp, increment stats.rx_keepalive counter, skip TAP delivery, continue to next packet\n- If payload_len > 0: proceed with existing TAP write logic\n- Add new AtomicU64 field rx_keepalive to TunnelStats struct in crates/eoip-rs/src/stats.rs\n- Ensure validation still checks magic bytes and tunnel ID for keepalive packets\n- Update eoip-proto validation functions to explicitly allow zero-length payloads",
+            "status": "pending",
+            "testStrategy": "RX test with crafted keepalive: send 8-byte EoIP packet with payload_len=0, verify stats.last_rx updates but no TAP write. Verify stats.rx_keepalive increments. Mixed traffic test: interleave data frames and keepalives, verify both processed correctly. Malformed keepalive rejection test"
+          },
+          {
+            "id": 3,
+            "title": "Integrate keepalive into tunnel lifecycle state machine",
+            "description": "Wire keepalive manager into tunnel creation/destruction flow, ensuring Active state spawns keepalive task and Stale state stops TX while maintaining RX demux entry",
+            "dependencies": [
+              2
+            ],
+            "details": "Update crates/eoip-rs/src/tunnel/lifecycle.rs:\n- In transition to ACTIVE state: call keepalive::spawn_keepalive_task(), store CancellationToken in TunnelHandle\n- Subscribe keepalive state changes: when KeepaliveManager signals Stale, transition tunnel to STALE state\n- In STALE state: cancel TAP reader task (stop TX), keep tunnel entry in DemuxTable (preserve RX)\n- On keepalive recovery (last_rx updates within timeout): transition STALE → ACTIVE, respawn TAP reader and keepalive tasks\n- In TEARING_DOWN: cancel keepalive task, remove from DemuxTable, close TAP fd\n- Update TunnelHandle struct to include keepalive_cancel: Option<CancellationToken>\n- Emit tracing events for all state transitions with tunnel_id, peer_addr, state fields",
+            "status": "pending",
+            "testStrategy": "Lifecycle test: create tunnel, verify Active spawns keepalive. Stale simulation: mock timeout, verify TX stops but RX continues. Recovery test: resume RX traffic, verify Active restoration. Teardown test: verify keepalive task cancelled and no resource leaks. State machine invariant tests using proptest"
+          },
+          {
+            "id": 4,
+            "title": "Create integration test suite for tunnel pairs and MikroTik interop",
+            "description": "Implement tests/integration/eoip_pair.rs for local tunnel testing and tests/interop/mikrotik_compat.rs for protocol compatibility validation using reference packet captures",
+            "dependencies": [
+              3
+            ],
+            "details": "Create tests/integration/eoip_pair.rs:\n- Setup: spawn two eoip-rs instances with local IPs, configure as peers (tunnel_id=100)\n- Create two TAP interfaces via helper, bridge to test namespace\n- Inject crafted Ethernet frames (ARP, ICMP, TCP SYN) via raw packet writing\n- Verify frames delivered to peer TAP with byte-exact comparison\n- Test keepalive: disable one side's RX (iptables DROP), verify Stale after timeout, re-enable, verify Active recovery\n- Cleanup: teardown tunnels, verify no leaked file descriptors (lsof check)\n\nCreate tests/interop/mikrotik_compat.rs:\n- Load tests/fixtures/mikrotik_eoip_capture.pcap containing reference MikroTik packets\n- Parse with pcap crate, extract EoIP payloads\n- Decode using eoip_proto::decode_eoip_header(), verify tunnel_id, payload_len extraction\n- Encode same tunnel_id + payload via eoip_proto::encode_eoip_header(), compare byte-exact match\n- Test TID=42, 1000, 4095 for boundary coverage\n- Verify mixed-endianness (BE payload_len, LE tunnel_id) matches MikroTik wire format",
+            "status": "pending",
+            "testStrategy": "E2E eoip_pair: verify roundtrip latency <500us, no packet loss over 10K frames. MikroTik interop: byte-exact wire format match for all test vectors. Keepalive recovery: verify <2 second recovery time after RX resume. Run tests in CI with network namespaces (Linux) or skip on unsupported platforms"
+          },
+          {
+            "id": 5,
+            "title": "Add performance benchmarks and deployment artifacts",
+            "description": "Create Criterion throughput/latency benchmarks, example config file, systemd service units, and update README with quick-start guide",
+            "dependencies": [
+              4
+            ],
+            "details": "Create tests/perf/throughput.rs:\n- Use Criterion harness with iperf3 subprocess\n- Setup: two eoip-rs instances in loopback mode\n- Benchmark: iperf3 TCP stream for 10 seconds, measure Gbps\n- Assert throughput >3 Gbps on modern hardware (baseline for regression)\n\nCreate tests/perf/latency.rs:\n- Use hping3 or custom ping tool sending ICMP through tunnel\n- Measure RTT for 1000 pings under load (concurrent iperf3)\n- Assert p99 latency <500us\n\nCreate config/eoip-rs.example.toml with documented examples:\n- Basic IPv4 tunnel, IPv6 tunnel, UDP-encapsulated tunnel\n- Keepalive settings, performance tuning, logging config\n\nCreate systemd/eoip-helper.service and systemd/eoip-rs.service:\n- Proper dependency ordering, restart policies, privilege separation\n- User/Group directives, ReadWritePaths for /dev/net/tun\n\nUpdate README.md:\n- Installation (cargo install, binary releases)\n- Quick-start: single tunnel setup in 5 steps\n- MikroTik interop example config\n- Performance benchmarks results table\n- Link to docs/design/ for architecture details",
+            "status": "pending",
+            "testStrategy": "Benchmark regression: CI runs benchmarks on stable hardware, fails if throughput <3Gbps or p99 >500us. Config validation: parse example config, verify no errors. Systemd dry-run: systemd-analyze verify service files. README smoke test: follow quick-start steps in clean Docker container"
+          }
+        ]
+      }
+    ],
+    "metadata": {
+      "created": "2026-04-17T05:36:24.848Z",
+      "updated": "2026-04-17T05:36:24.848Z",
+      "description": "Tasks for master context"
+    }
+  }
+}

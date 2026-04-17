@@ -1,0 +1,212 @@
+# EoIP-rs: Userspace EoIP/EoIPv6 Implementation in Rust
+
+## Project Overview
+
+EoIP-rs is a userspace EoIP (Ethernet over IP) and EoIPv6 implementation in Rust, compatible with MikroTik RouterOS. It enables Layer 2 (Ethernet frame) tunneling over IP networks, designed to chain with VPN protocols like WireGuard, SSTP, and ZeroTier for long-distance bridging.
+
+### Target Platforms
+- **Primary**: Linux (full TAP/L2 support)
+- **Future**: macOS, Windows, Android (incremental, TUN+bridge approach)
+
+### Key Design Decisions
+- MikroTik-compatible wire format (native GRE proto 47 + EtherIP proto 97)
+- UDP encapsulation mode for NAT traversal (designed but built later)
+- Full dual-stack: IPv4/IPv6 any combination
+- Privilege separation: root helper + unprivileged daemon
+- Shared raw socket + userspace demux via lock-free DashMap
+- gRPC management API with streaming
+- Adaptive batching for balanced latency/throughput
+- No built-in encryption (VPN handles security)
+
+## Architecture
+
+### Crate Structure (Cargo workspace)
+
+1. **eoip-proto** — Pure protocol library (no async, no I/O)
+   - MikroTik GRE header encode/decode (8-byte header, mixed endianness)
+   - EtherIP header encode/decode (2-byte header, 12-bit tunnel ID)
+   - UDP shim header encode/decode (4-byte "EO" magic + type)
+   - Packet validation pipeline
+   - Error types
+   - Helper<->Daemon wire protocol messages
+
+2. **eoip-api** — gRPC service definitions
+   - Protobuf definitions (TunnelService, StatsService, HealthService)
+   - tonic-build code generation
+   - Tunnel CRUD operations
+   - WatchTunnels streaming RPC
+   - TunnelStats and GlobalStats queries
+
+3. **eoip-helper** — Privileged helper binary (~200 lines)
+   - TAP interface creation via /dev/net/tun ioctl
+   - Raw socket creation (AF_INET/SOCK_RAW/47, AF_INET6/SOCK_RAW/97)
+   - FD passing via SCM_RIGHTS over Unix socket
+   - Privilege dropping (setuid/setgid)
+   - MODE_PERSIST (stay alive) and MODE_EXIT (create and exit)
+
+4. **eoip-rs** — Main daemon binary
+   - Config loading (TOML)
+   - Tunnel management (lifecycle FSM)
+   - Packet processing (TX and RX paths)
+   - Adaptive batching (sendmmsg/recvmmsg)
+   - gRPC API server
+   - Keepalive state machine
+   - Stats collection
+   - Graceful shutdown
+
+### Wire Format
+
+#### EoIP (IPv4, IP Protocol 47)
+- 8-byte header: Magic(0x20016400) + PayloadLen(2B BE) + TunnelID(2B LE)
+- Mixed endianness is intentional MikroTik behavior
+- Tunnel ID range: 0-65535
+
+#### EoIPv6 (IPv6, IP Protocol 97 / EtherIP)
+- 2-byte header: TID_high(4 bits) | Version(0x3, 4 bits) | TID_low(8 bits)
+- Tunnel ID range: 0-4095 (12 bits)
+
+#### UDP Encapsulation (EoIP-rs extension, NOT MikroTik-compatible)
+- 4-byte shim: Magic("EO"/0x454F) + Type(0x04=EoIP, 0x06=EoIPv6) + Reserved(0x00)
+- Default port: 26969
+
+### Threading Model
+- Tokio multi-threaded runtime for management, TX path, gRPC
+- Dedicated OS threads for RX hot path (recvmmsg tight loop)
+- Per-tunnel tokio tasks for TAP reading
+- TX batcher tasks per protocol (adaptive batching)
+- Lock-free: DashMap for demux, AtomicU64 for stats, crossbeam channels for RX→consumer
+
+### Packet Flow
+
+**TX**: TAP read → header prepend (zero-copy headroom) → adaptive batch → sendmmsg on shared raw socket
+**RX**: recvmmsg on shared raw socket → parse header → DashMap demux by (TunnelID, SrcIP) → crossbeam channel → TAP write
+
+### Buffer Pool
+- Pre-allocated PacketBuf with 64B headroom + 1522B payload = 1586B
+- Lock-free ArrayQueue (crossbeam) for MPMC get/put
+- Return-on-drop semantics
+- No malloc in hot path
+
+### Tunnel Lifecycle
+States: Initializing → Configured → Active → Stale → TearingDown → Destroyed
+- Keepalive: configurable interval (default 10s) and timeout (default 30s)
+- Stale tunnels stop TX but keep RX to detect recovery
+
+### Configuration (TOML)
+```toml
+[daemon]
+user = "eoip"
+group = "eoip"
+helper_mode = "persist"
+helper_socket = "/run/eoip-rs/helper.sock"
+
+[api]
+listen = "[::1]:50051"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[performance]
+low_water_mark = 8
+high_water_mark = 256
+max_batch_size = 64
+batch_timeout_us = 50
+channel_buffer = 1024
+rx_workers = 1
+
+[[tunnel]]
+tunnel_id = 100
+local = "192.168.1.1"
+remote = "192.168.1.2"
+iface_name = "eoip-dc1"
+mtu = 1500
+enabled = true
+```
+
+## Implementation Tasks
+
+### Phase 1: Protocol Library (eoip-proto)
+1. Set up Cargo workspace with all 4 crates
+2. Implement EoIP GRE header encode/decode with mixed-endianness handling
+3. Implement EoIPv6/EtherIP header encode/decode with 12-bit tunnel ID nibble-packing
+4. Implement UDP shim header encode/decode
+5. Implement packet validation pipeline (fail-fast checks from protocol spec)
+6. Define error types (EoipError enum with thiserror)
+7. Define shared types (DemuxKey, TunnelId, TunnelConfig, TunnelStats)
+8. Implement helper<->daemon wire protocol message types
+9. Add comprehensive unit tests for all encode/decode with byte-level verification
+10. Add property-based tests (proptest) for encode/decode roundtrips
+
+### Phase 2: Privileged Helper (eoip-helper)
+11. Implement TAP interface creation via /dev/net/tun ioctl (IFF_TAP|IFF_NO_PI)
+12. Implement raw socket creation (AF_INET/SOCK_RAW/47 and AF_INET6/SOCK_RAW/97)
+13. Implement SCM_RIGHTS FD passing over Unix domain socket
+14. Implement privilege dropping (setuid/setgid after resource creation)
+15. Implement helper main loop (MODE_PERSIST: listen for DaemonMsg, MODE_EXIT: create and exit)
+16. Add CLI argument parsing (clap) for helper binary
+
+### Phase 3: Core Daemon Infrastructure (eoip-rs)
+17. Implement TOML config file parsing and validation
+18. Implement FD receiver (SCM_RIGHTS receive from helper Unix socket)
+19. Implement TunnelRegistry with DashMap<DemuxKey, TunnelHandle>
+20. Implement tunnel lifecycle state machine (Initializing→Active→Stale→TearingDown)
+21. Implement TunnelStats with AtomicU64 counters (rx/tx packets/bytes/errors, timestamps)
+22. Implement buffer pool (crossbeam ArrayQueue, PacketBuf with headroom, return-on-drop)
+23. Implement graceful shutdown coordinator (CancellationToken, signal handling)
+
+### Phase 4: Packet Processing (eoip-rs)
+24. Implement RX path: dedicated OS thread with recvmmsg loop + DashMap demux
+25. Implement TX path: tokio task per tunnel reading TAP → channel → TX batcher
+26. Implement adaptive batching state machine (immediate at low load, sendmmsg at high load)
+27. Implement TAP AsyncFd wrappers for non-blocking read/write
+28. Implement raw socket wrappers with sendmmsg/recvmmsg
+29. Wire up full TX pipeline: TAP read → encode → batch → raw socket
+30. Wire up full RX pipeline: raw socket → decode → demux → TAP write
+31. Implement keepalive send/receive (zero-payload EoIP packets)
+
+### Phase 5: gRPC API (eoip-api + eoip-rs)
+32. Define protobuf schema (Tunnel, TunnelState, TunnelStats, TunnelEvent messages)
+33. Implement TunnelService (CreateTunnel, DeleteTunnel, ListTunnels, GetTunnel, WatchTunnels)
+34. Implement StatsService (GetStats, GetGlobalStats)
+35. Implement HealthService (Check)
+36. Wire gRPC server into daemon main with Arc<TunnelManager>
+
+### Phase 6: Integration Testing
+37. End-to-end test: create tunnel pair, send Ethernet frames, verify delivery
+38. MikroTik interop test: verify wire format against captured MikroTik packets
+39. Performance benchmark: iperf3 throughput, ping latency, packet rate
+40. Stress test: multiple tunnels, high packet rate, verify no memory leaks
+41. Keepalive test: verify stale detection and recovery
+
+### Phase 7: Packaging and Distribution
+42. Create systemd service files (eoip-helper.service, eoip-rs.service)
+43. Create example configuration file
+44. Write user-facing README with quick-start guide
+45. Set up CI/CD (GitHub Actions: build, test, clippy, fmt, criterion benchmarks)
+
+## Performance Targets
+- TCP throughput: 3-8 Gbps (MTU 1500)
+- Packet rate: 500K-1.2M pps (64B frames)
+- Added latency: <150us idle, <500us p99 loaded
+- Memory: <50MB RSS for 100 tunnels
+
+## Security Model
+- Privilege separation (root helper, unprivileged daemon)
+- Source IP validation per tunnel
+- gRPC on localhost by default, optional mTLS
+- No encryption (VPN handles it)
+- Tunnel ID is demux key, not security credential
+
+## Dependencies
+- tokio (async runtime)
+- nix (Unix syscalls, ioctl, SCM_RIGHTS)
+- socket2 (raw socket creation)
+- dashmap (lock-free concurrent HashMap)
+- bytes (buffer management)
+- crossbeam (lock-free queue, channels)
+- tonic + prost (gRPC)
+- serde + toml (config)
+- tracing + tracing-subscriber (logging)
+- clap (CLI)
+- thiserror (error types)
