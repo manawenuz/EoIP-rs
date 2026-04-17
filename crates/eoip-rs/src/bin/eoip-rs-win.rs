@@ -1,28 +1,30 @@
 //! Windows EoIP-rs daemon entry point.
 //!
-//! Self-contained — no helper binary needed. Runs as Administrator,
-//! creates TAP device and raw sockets directly.
+//! Self-contained — no helper binary needed. Runs as Administrator.
+//! Uses tap-windows6 for the tunnel interface and WinDivert for
+//! GRE packet capture/injection (bypassing Windows raw socket limitations).
 
 #![cfg(target_os = "windows")]
 
-use std::net::{IpAddr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+use windivert::prelude::*;
 
 use eoip_proto::gre::{self, EOIP_HEADER_LEN};
 use eoip_proto::DemuxKey;
 
 use eoip_rs::config::parse_config;
 use eoip_rs::net::tap_windows::{self, WinTapDevice};
-/// Maximum Ethernet frame size (same as packet::buffer::MAX_FRAME_SIZE).
-const MAX_FRAME_SIZE: usize = 1522;
 use eoip_rs::tunnel::handle::TunnelHandle;
 use eoip_rs::tunnel::lifecycle::TunnelState;
 use eoip_rs::tunnel::registry::TunnelRegistry;
+
+const MAX_FRAME_SIZE: usize = 1522;
 
 #[derive(Parser, Debug)]
 #[command(name = "eoip-rs", version, about = "EoIP-rs Windows daemon")]
@@ -57,20 +59,15 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let registry = Arc::new(TunnelRegistry::new());
-
-    // Create raw GRE socket (Winsock SOCK_RAW, proto 47)
-    let raw_socket = create_raw_gre_socket(&config.tunnels[0].local)?;
-    tracing::info!("raw GRE socket created");
+    let tunnel_cfg = &config.tunnels[0];
 
     // Open TAP adapter
     let tap_guid = tap_windows::find_tap_guid(None)?;
     tracing::info!(guid = %tap_guid, "found TAP adapter");
-
     let tap = Arc::new(WinTapDevice::open(&tap_guid)?);
     tracing::info!("TAP device opened and connected");
 
     // Register tunnel
-    let tunnel_cfg = &config.tunnels[0];
     let handle = Arc::new(TunnelHandle::new(tunnel_cfg.clone()));
     let key = DemuxKey {
         tunnel_id: tunnel_cfg.tunnel_id,
@@ -81,27 +78,48 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let _ = handle.state.transition(TunnelState::Configured, TunnelState::Active);
     tracing::info!(tunnel_id = tunnel_cfg.tunnel_id, "tunnel active");
 
-    // Spawn TX thread: TAP read → EoIP encode → raw socket send
+    // WinDivert filter: capture inbound GRE from our peer
+    let remote_ip = match tunnel_cfg.remote {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(_) => return Err("IPv6 not yet supported on Windows".into()),
+    };
+    let filter = format!("ip.Protocol == 47 and ip.SrcAddr == {}", remote_ip);
+    tracing::info!(%filter, "opening WinDivert for GRE capture");
+
+    let divert = WinDivert::network(&filter, 0, WinDivertFlags::new())?;
+    tracing::info!("WinDivert RX handle opened");
+
+    // TX: separate send-only handle
+    let tx_divert = WinDivert::network("false", 0, WinDivertFlags::new().set_send_only())?;
+    tracing::info!("WinDivert TX handle opened");
+
+    // Spawn TX thread: TAP read → EoIP encode → WinDivert inject
     let tx_tap = Arc::clone(&tap);
     let tx_remote = tunnel_cfg.remote;
+    let tx_local = tunnel_cfg.local;
     let tx_tid = tunnel_cfg.tunnel_id;
-    let tx_socket = raw_socket.try_clone()?;
     let tx_stats = Arc::clone(&handle.stats);
 
-    let tx_thread = std::thread::spawn(move || {
-        let mut buf = vec![0u8; EOIP_HEADER_LEN + MAX_FRAME_SIZE];
+    let _tx_thread = std::thread::spawn(move || {
+        let mut pkt = vec![0u8; 20 + EOIP_HEADER_LEN + MAX_FRAME_SIZE];
         loop {
-            match tx_tap.read_blocking(&mut buf[EOIP_HEADER_LEN..]) {
+            match tx_tap.read_blocking(&mut pkt[20 + EOIP_HEADER_LEN..]) {
                 Ok(n) if n > 0 => {
-                    // Prepend EoIP header
-                    if gre::encode_eoip_header(tx_tid, n as u16, &mut buf[..EOIP_HEADER_LEN]).is_ok() {
-                        let dest = match tx_remote {
-                            IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, 0)),
-                            _ => continue,
+                    let total_len = (20 + EOIP_HEADER_LEN + n) as u16;
+                    build_ip_header(&mut pkt[..20], total_len, 47, &tx_local, &tx_remote);
+
+                    if gre::encode_eoip_header(tx_tid, n as u16, &mut pkt[20..28]).is_ok() {
+                        let packet = WinDivertPacket {
+                            address: unsafe { WinDivertAddress::<NetworkLayer>::new() },
+                            data: Cow::Borrowed(&pkt[..20 + EOIP_HEADER_LEN + n]),
                         };
-                        let _ = tx_socket.send_to(&buf[..EOIP_HEADER_LEN + n], dest);
-                        tx_stats.tx_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tx_stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        match tx_divert.send(&packet) {
+                            Ok(_) => {
+                                tx_stats.tx_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tx_stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(e) => tracing::warn!(%e, "WinDivert TX failed"),
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -114,49 +132,49 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Spawn keepalive thread
-    let ka_socket = raw_socket.try_clone()?;
+    let ka_local = tunnel_cfg.local;
     let ka_remote = tunnel_cfg.remote;
     let ka_tid = tunnel_cfg.tunnel_id;
     let ka_interval = std::time::Duration::from_secs(tunnel_cfg.keepalive_interval_secs);
+    let ka_divert = WinDivert::network("false", 0, WinDivertFlags::new().set_send_only())?;
 
-    let ka_thread = std::thread::spawn(move || {
-        let mut hdr = [0u8; EOIP_HEADER_LEN];
+    let _ka_thread = std::thread::spawn(move || {
+        let mut pkt = [0u8; 20 + EOIP_HEADER_LEN];
         loop {
-            if gre::encode_eoip_header(ka_tid, 0, &mut hdr).is_ok() {
-                let dest = match ka_remote {
-                    IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, 0)),
-                    _ => break,
+            build_ip_header(&mut pkt[..20], 28, 47, &ka_local, &ka_remote);
+            if gre::encode_eoip_header(ka_tid, 0, &mut pkt[20..28]).is_ok() {
+                let packet = WinDivertPacket {
+                    address: unsafe { WinDivertAddress::<NetworkLayer>::new() },
+                    data: Cow::Borrowed(&pkt[..]),
                 };
-                let _ = ka_socket.send_to(&hdr, dest);
+                let _ = ka_divert.send(&packet);
             }
             std::thread::sleep(ka_interval);
         }
     });
 
-    // Main thread: RX — raw socket recv → EoIP decode → TAP write
+    // Main thread: RX — WinDivert recv GRE → decode → TAP write
     tracing::info!("entering RX loop");
-    let mut rx_buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; 65536];
     loop {
-        match raw_socket.recv_from(&mut rx_buf) {
-            Ok((n, src_addr)) => {
-                if n < 20 {
-                    continue; // Too short for IP header
-                }
-
-                // Parse IP header to get to GRE payload
-                let ip_hdr_len = ((rx_buf[0] & 0x0F) as usize) * 4;
-                if n < ip_hdr_len + EOIP_HEADER_LEN {
+        match divert.recv(&mut buf) {
+            Ok(packet) => {
+                let data = &*packet.data;
+                if data.len() < 20 {
                     continue;
                 }
-                let proto = rx_buf[9];
-                if proto != 47 {
-                    continue; // Not GRE
+
+                let ip_hdr_len = ((data[0] & 0x0F) as usize) * 4;
+                if data.len() < ip_hdr_len + EOIP_HEADER_LEN {
+                    continue;
                 }
 
-                let gre_payload = &rx_buf[ip_hdr_len..n];
+                let gre_payload = &data[ip_hdr_len..];
                 match gre::decode_eoip_header(gre_payload) {
                     Ok((tid, payload_len, hdr_len)) => {
                         if tid != tunnel_cfg.tunnel_id {
+                            // Not our tunnel — reinject
+                            let _ = divert.send(&packet);
                             continue;
                         }
 
@@ -170,39 +188,39 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         handle.stats.last_rx_timestamp.store(now_ms, std::sync::atomic::Ordering::Relaxed);
 
                         if payload_len > 0 {
-                            let frame = &gre_payload[hdr_len..hdr_len + payload_len as usize];
-                            let _ = tap.write_blocking(frame);
+                            let end = hdr_len + payload_len as usize;
+                            if gre_payload.len() >= end {
+                                let _ = tap.write_blocking(&gre_payload[hdr_len..end]);
+                            }
                         }
                     }
-                    Err(_) => continue,
+                    Err(_) => {
+                        let _ = divert.send(&packet);
+                    }
                 }
             }
             Err(e) => {
-                tracing::error!(%e, "raw socket recv error");
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                tracing::error!(%e, "WinDivert recv error");
+                break;
             }
         }
     }
+
+    Ok(())
 }
 
-/// Create a raw socket bound to a local IP for GRE (protocol 47).
-fn create_raw_gre_socket(local: &IpAddr) -> Result<UdpSocket, Box<dyn std::error::Error>> {
-    use std::os::windows::io::FromRawSocket;
+fn build_ip_header(buf: &mut [u8], total_len: u16, protocol: u8, src: &IpAddr, dst: &IpAddr) {
+    let src_octets = match src { IpAddr::V4(v4) => v4.octets(), _ => [0; 4] };
+    let dst_octets = match dst { IpAddr::V4(v4) => v4.octets(), _ => [0; 4] };
 
-    // Windows raw sockets: socket(AF_INET, SOCK_RAW, IPPROTO_GRE)
-    // We use the socket2 crate for this
-    let domain = socket2::Domain::IPV4;
-    let sock = socket2::Socket::new(domain, socket2::Type::RAW, Some(socket2::Protocol::from(47)))?;
-
-    // Bind to local address
-    let bind_addr: SocketAddr = match local {
-        IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4, 0)),
-        _ => return Err("IPv6 not supported on Windows yet".into()),
-    };
-    sock.bind(&bind_addr.into())?;
-
-    // Convert to std UdpSocket for simple send_to/recv_from
-    // (raw sockets work with the same API on Windows)
-    let raw_fd = sock.into_raw_socket();
-    Ok(unsafe { UdpSocket::from_raw_socket(raw_fd) })
+    buf[0] = 0x45; // IPv4, IHL=5
+    buf[1] = 0x00; // DSCP=0
+    buf[2..4].copy_from_slice(&total_len.to_be_bytes());
+    buf[4..6].copy_from_slice(&[0x00, 0x00]); // ID
+    buf[6..8].copy_from_slice(&[0x00, 0x00]); // Flags (DF=0)
+    buf[8] = 255;  // TTL=255
+    buf[9] = protocol;
+    buf[10..12].copy_from_slice(&[0x00, 0x00]); // Checksum (WinDivert recalculates)
+    buf[12..16].copy_from_slice(&src_octets);
+    buf[16..20].copy_from_slice(&dst_octets);
 }
