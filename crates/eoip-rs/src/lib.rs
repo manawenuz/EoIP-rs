@@ -1,10 +1,14 @@
 //! EoIP-rs daemon — userspace EoIP/EoIPv6 tunneling compatible with MikroTik RouterOS.
 
+#[cfg(unix)]
 pub mod api;
 pub mod config;
+#[cfg(unix)]
 pub mod keepalive;
 pub mod net;
+#[cfg(unix)]
 pub mod packet;
+#[cfg(unix)]
 pub mod shutdown;
 pub mod tunnel;
 

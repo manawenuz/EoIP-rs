@@ -2,47 +2,48 @@
 
 use std::sync::Arc;
 
-use crossbeam::channel::{self, Receiver, Sender};
-
 use eoip_proto::TunnelStats;
 
 use crate::config::TunnelConfig;
-use crate::packet::buffer::PacketBuf;
 use crate::tunnel::lifecycle::AtomicTunnelState;
 
-/// Channel capacity for RX packets per tunnel.
-const RX_CHANNEL_CAP: usize = 1024;
+#[cfg(unix)]
+mod unix_fields {
+    pub use crossbeam::channel::{self, Receiver, Sender};
+    pub use crate::packet::buffer::PacketBuf;
+    pub const RX_CHANNEL_CAP: usize = 1024;
+}
 
 /// Runtime handle for a single tunnel, stored in the `TunnelRegistry`.
-///
-/// All fields are `Arc`-wrapped or atomic for safe sharing between
-/// the TX task, RX demux path, keepalive timer, and gRPC API.
 #[derive(Debug)]
 pub struct TunnelHandle {
-    /// Static configuration for this tunnel.
     pub config: TunnelConfig,
-    /// Lifecycle state (lock-free atomic).
     pub state: AtomicTunnelState,
-    /// Packet/byte counters (lock-free atomics).
     pub stats: Arc<TunnelStats>,
-    /// TAP file descriptor (set after helper provides it).
+    #[cfg(unix)]
     pub tap_fd: Option<std::os::fd::OwnedFd>,
-    /// Crossbeam sender: RX worker → TAP writer task.
-    pub rx_channel: Option<Sender<PacketBuf>>,
-    /// Crossbeam receiver: consumed by TAP writer task.
-    pub rx_receiver: Option<Receiver<PacketBuf>>,
+    #[cfg(unix)]
+    pub rx_channel: Option<unix_fields::Sender<unix_fields::PacketBuf>>,
+    #[cfg(unix)]
+    pub rx_receiver: Option<unix_fields::Receiver<unix_fields::PacketBuf>>,
 }
 
 impl TunnelHandle {
     pub fn new(config: TunnelConfig) -> Self {
         use crate::tunnel::lifecycle::TunnelState;
-        let (tx, rx) = channel::bounded(RX_CHANNEL_CAP);
+
+        #[cfg(unix)]
+        let (tx, rx) = unix_fields::channel::bounded(unix_fields::RX_CHANNEL_CAP);
+
         Self {
             config,
             state: AtomicTunnelState::new(TunnelState::Initializing),
             stats: Arc::new(TunnelStats::new()),
+            #[cfg(unix)]
             tap_fd: None,
+            #[cfg(unix)]
             rx_channel: Some(tx),
+            #[cfg(unix)]
             rx_receiver: Some(rx),
         }
     }
