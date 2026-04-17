@@ -5,6 +5,7 @@ members = [
     "crates/eoip-api",
     "crates/eoip-helper",
     "crates/eoip-rs",
+    "crates/eoip-analyzer",
 ]
 
 [workspace.package]
@@ -15,7 +16,7 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-nix = { version = "0.29", features = ["net", "ioctl", "socket", "user"] }
+nix = { version = "0.29", features = ["net", "ioctl", "socket", "user", "uio"] }
 socket2 = { version = "0.5", features = ["all"] }
 dashmap = "6"
 bytes = "1"

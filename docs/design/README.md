@@ -21,6 +21,7 @@ EoIP-rs is a **userspace** EoIP (Ethernet over IP) and EoIPv6 implementation in 
 | [Performance Design](performance.md) | Syscall optimization, buffer pools, benchmarking strategy |
 | [Platform Abstraction](platform.md) | Cross-platform TAP/TUN, raw sockets, privilege models |
 | [Security Model](security.md) | Privilege separation, threat model, attack surface |
+| [Testing & Validation](../testing/README.md) | 9-phase testing plan, network topologies, infrastructure |
 
 ## Decision Log
 

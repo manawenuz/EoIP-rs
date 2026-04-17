@@ -1,0 +1,15 @@
+[package]
+name = "eoip-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "gRPC service definitions for EoIP-rs"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"

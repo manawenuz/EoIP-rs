@@ -1,0 +1,21 @@
+[Unit]
+Description=EoIP-rs Privileged Helper
+Documentation=https://github.com/yourusername/eoip-rs
+Before=eoip-rs.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/eoip-helper --mode persist --socket-path /run/eoip-rs/helper.sock
+RuntimeDirectory=eoip-rs
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

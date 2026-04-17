@@ -1,0 +1,20 @@
+[package]
+name = "eoip-analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI tool to analyze MikroTik EoIP pcap captures for interop validation"
+
+[[bin]]
+name = "eoip-analyzer"
+path = "src/main.rs"
+
+[dependencies]
+eoip-proto = { path = "../eoip-proto" }
+pcap-file = "2"
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+colored = "2"
+thiserror = { workspace = true }

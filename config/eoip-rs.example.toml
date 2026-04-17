@@ -1,0 +1,49 @@
+# EoIP-rs daemon configuration
+# Copy to /etc/eoip-rs/config.toml and adjust for your environment.
+
+[daemon]
+user = "eoip"
+group = "eoip"
+helper_mode = "persist"            # "persist" = dynamic tunnels, "exit" = static config only
+helper_socket = "/run/eoip-rs/helper.sock"
+
+[api]
+listen = "[::1]:50051"             # gRPC API bind address (localhost only by default)
+
+[logging]
+level = "info"                     # trace, debug, info, warn, error
+format = "pretty"                  # "pretty" or "json"
+
+[performance]
+low_water_mark = 8                 # Below this → immediate send (low latency)
+high_water_mark = 256              # Above this → force batch flush
+max_batch_size = 64                # Max packets per sendmmsg call
+batch_timeout_us = 50              # Max wait before flushing a partial batch (microseconds)
+channel_buffer = 1024              # Per-tunnel RX channel depth
+rx_workers = 1                     # RX threads per protocol (usually 1)
+
+# ── Tunnel definitions ───────────────────────────────────────────
+# Each [[tunnel]] block defines one EoIP tunnel.
+# IPv4 tunnels use EoIP (proto 47), IPv6 tunnels use EoIPv6 (proto 97).
+
+[[tunnel]]
+tunnel_id = 100
+local = "192.168.1.1"
+remote = "192.168.1.2"
+iface_name = "eoip-dc1"           # Optional: auto-generated as "eoip{id}" if omitted
+mtu = 1500
+enabled = true
+keepalive_interval_secs = 10
+keepalive_timeout_secs = 30
+
+# [[tunnel]]
+# tunnel_id = 200
+# local = "10.0.0.1"
+# remote = "10.0.0.2"
+# mtu = 1400
+
+# IPv6 example (tunnel_id must be <= 4095 for EoIPv6):
+# [[tunnel]]
+# tunnel_id = 42
+# local = "fd00::1"
+# remote = "fd00::2"

@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package eoip.v1;
+
+// ── Messages ────────────────────────────────────────────────────
+
+message Tunnel {
+  uint32 tunnel_id = 1;
+  string local_addr = 2;
+  string remote_addr = 3;
+  string iface_name = 4;
+  uint32 mtu = 5;
+  bool enabled = 6;
+  TunnelState state = 7;
+}
+
+enum TunnelState {
+  TUNNEL_STATE_UNSPECIFIED = 0;
+  TUNNEL_STATE_INITIALIZING = 1;
+  TUNNEL_STATE_CONFIGURED = 2;
+  TUNNEL_STATE_ACTIVE = 3;
+  TUNNEL_STATE_STALE = 4;
+  TUNNEL_STATE_TEARING_DOWN = 5;
+  TUNNEL_STATE_DESTROYED = 6;
+}
+
+message TunnelStats {
+  uint32 tunnel_id = 1;
+  uint64 tx_packets = 2;
+  uint64 tx_bytes = 3;
+  uint64 rx_packets = 4;
+  uint64 rx_bytes = 5;
+  uint64 tx_errors = 6;
+  uint64 rx_errors = 7;
+  int64 last_rx_timestamp_ms = 8;
+  int64 last_tx_timestamp_ms = 9;
+}
+
+message GlobalStats {
+  uint32 active_tunnels = 1;
+  uint32 stale_tunnels = 2;
+  uint64 total_tx_packets = 3;
+  uint64 total_rx_packets = 4;
+  uint64 total_tx_bytes = 5;
+  uint64 total_rx_bytes = 6;
+}
+
+message TunnelEvent {
+  EventType event_type = 1;
+  Tunnel tunnel = 2;
+  int64 timestamp_ms = 3;
+
+  enum EventType {
+    EVENT_TYPE_UNSPECIFIED = 0;
+    EVENT_TYPE_CREATED = 1;
+    EVENT_TYPE_UPDATED = 2;
+    EVENT_TYPE_DELETED = 3;
+    EVENT_TYPE_STATE_CHANGED = 4;
+  }
+}
+
+// ── Tunnel Service ──────────────────────────────────────────────
+
+message CreateTunnelRequest {
+  uint32 tunnel_id = 1;
+  string local_addr = 2;
+  string remote_addr = 3;
+  string iface_name = 4;
+  uint32 mtu = 5;
+}
+
+message CreateTunnelResponse {
+  Tunnel tunnel = 1;
+}
+
+message DeleteTunnelRequest {
+  uint32 tunnel_id = 1;
+}
+
+message DeleteTunnelResponse {}
+
+message GetTunnelRequest {
+  uint32 tunnel_id = 1;
+}
+
+message GetTunnelResponse {
+  Tunnel tunnel = 1;
+}
+
+message ListTunnelsRequest {}
+
+message ListTunnelsResponse {
+  repeated Tunnel tunnels = 1;
+}
+
+message WatchTunnelsRequest {}
+
+service TunnelService {
+  rpc CreateTunnel(CreateTunnelRequest) returns (CreateTunnelResponse);
+  rpc DeleteTunnel(DeleteTunnelRequest) returns (DeleteTunnelResponse);
+  rpc GetTunnel(GetTunnelRequest) returns (GetTunnelResponse);
+  rpc ListTunnels(ListTunnelsRequest) returns (ListTunnelsResponse);
+  rpc WatchTunnels(WatchTunnelsRequest) returns (stream TunnelEvent);
+}
+
+// ── Stats Service ───────────────────────────────────────────────
+
+message GetStatsRequest {
+  uint32 tunnel_id = 1;
+}
+
+message GetStatsResponse {
+  TunnelStats stats = 1;
+}
+
+message GetGlobalStatsRequest {}
+
+message GetGlobalStatsResponse {
+  GlobalStats stats = 1;
+}
+
+service StatsService {
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc GetGlobalStats(GetGlobalStatsRequest) returns (GetGlobalStatsResponse);
+}
+
+// ── Health Service ──────────────────────────────────────────────
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  ServingStatus status = 1;
+
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+}
+
+service HealthService {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}
