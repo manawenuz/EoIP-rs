@@ -30,6 +30,13 @@ install -m 755 "$BIN_DIR/eoip-helper" "$PREFIX/bin/"
 install -m 755 "$BIN_DIR/eoip-cli" "$PREFIX/bin/"
 install -m 755 "$BIN_DIR/eoip-analyzer" "$PREFIX/bin/"
 
+# Install eoip-ifup helper
+if [[ -f "$SCRIPT_DIR/eoip-ifup" ]]; then
+    install -m 755 "$SCRIPT_DIR/eoip-ifup" "$PREFIX/bin/"
+elif [[ -f "$SCRIPT_DIR/../scripts/eoip-ifup" ]]; then
+    install -m 755 "$SCRIPT_DIR/../scripts/eoip-ifup" "$PREFIX/bin/"
+fi
+
 info "Creating config directory: $CONFIG_DIR"
 mkdir -p "$CONFIG_DIR"
 if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then

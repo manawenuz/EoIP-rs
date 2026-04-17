@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#
+# eoip-ifup — Configure EoIP TAP interfaces after daemon start.
+#
+# Called by systemd ExecStartPost. Reads tunnel IPs from
+# /etc/eoip-rs/interfaces.conf and brings up TAP devices.
+#
+# Config format (one line per interface):
+#   eoip100 10.255.0.2/30
+#   eoip200 10.255.1.2/30
+#
+set -euo pipefail
+
+CONF="${EOIP_INTERFACES:-/etc/eoip-rs/interfaces.conf}"
+
+if [[ ! -f "$CONF" ]]; then
+    echo "eoip-ifup: no interfaces config at $CONF (skipping)"
+    exit 0
+fi
+
+# Wait a moment for TAP devices to appear
+sleep 2
+
+while IFS=' ' read -r iface addr; do
+    # Skip comments and empty lines
+    [[ -z "$iface" || "$iface" == \#* ]] && continue
+
+    if ip link show "$iface" &>/dev/null; then
+        ip link set "$iface" up
+        ip addr add "$addr" dev "$iface" 2>/dev/null || true
+        echo "eoip-ifup: $iface up ($addr)"
+    else
+        echo "eoip-ifup: $iface not found (daemon may still be starting)"
+    fi
+done < "$CONF"

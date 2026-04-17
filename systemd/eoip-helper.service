@@ -1,18 +1,19 @@
 [Unit]
 Description=EoIP-rs Privileged Helper
-Documentation=https://github.com/yourusername/eoip-rs
+Documentation=https://github.com/manawenuz/EoIP-rs
 Before=eoip-rs.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/eoip-helper --mode persist --socket-path /run/eoip-rs/helper.sock
+ExecStartPre=/bin/mkdir -p /run/eoip-rs
+ExecStartPre=/bin/rm -f /run/eoip-rs/helper.sock
 RuntimeDirectory=eoip-rs
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0755
 Restart=on-failure
-RestartSec=5
+RestartSec=3
 
-# Security hardening
-NoNewPrivileges=no
+# Needs root for TAP creation and raw sockets
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
