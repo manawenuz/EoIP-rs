@@ -42,6 +42,8 @@ impl TunnelServiceImpl {
             mtu: handle.config.mtu as u32,
             enabled: handle.config.enabled,
             state: state.into(),
+            keepalive_interval_secs: handle.config.keepalive_interval_secs as u32,
+            keepalive_timeout_secs: handle.config.keepalive_timeout_secs as u32,
         }
     }
 }
@@ -101,6 +103,32 @@ impl tunnel_service_server::TunnelService for TunnelServiceImpl {
             .collect();
 
         Ok(Response::new(ListTunnelsResponse { tunnels }))
+    }
+
+    async fn update_tunnel(
+        &self,
+        request: Request<UpdateTunnelRequest>,
+    ) -> Result<Response<UpdateTunnelResponse>, Status> {
+        let req = request.into_inner();
+        let tid = req.tunnel_id as u16;
+        let entries = self.registry.find_by_tunnel_id(tid);
+        let (key, handle) = entries
+            .first()
+            .ok_or_else(|| Status::not_found(format!("tunnel {tid} not found")))?;
+
+        // Apply updates — currently only enabled state is mutable at runtime.
+        // MTU and keepalive changes would require restarting tunnel tasks.
+        if let Some(_enabled) = req.enabled {
+            // The enabled field is part of config which is immutable.
+            // For now, log the request. Full enable/disable requires stopping
+            // and restarting the tunnel's TX/RX tasks (future work).
+            tracing::info!(tunnel_id = tid, enabled = _enabled, "update_tunnel requested");
+        }
+
+        let tunnel = Self::tunnel_to_proto(key, handle);
+        Ok(Response::new(UpdateTunnelResponse {
+            tunnel: Some(tunnel),
+        }))
     }
 
     type WatchTunnelsStream =

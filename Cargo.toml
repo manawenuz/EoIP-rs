@@ -6,6 +6,7 @@ members = [
     "crates/eoip-helper",
     "crates/eoip-rs",
     "crates/eoip-analyzer",
+    "crates/eoip-cli",
 ]
 
 [workspace.package]

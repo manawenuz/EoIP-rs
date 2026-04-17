@@ -12,6 +12,8 @@ message Tunnel {
   uint32 mtu = 5;
   bool enabled = 6;
   TunnelState state = 7;
+  uint32 keepalive_interval_secs = 8;
+  uint32 keepalive_timeout_secs = 9;
 }
 
 enum TunnelState {
@@ -95,11 +97,24 @@ message ListTunnelsResponse {
 
 message WatchTunnelsRequest {}
 
+message UpdateTunnelRequest {
+  uint32 tunnel_id = 1;
+  optional bool enabled = 2;
+  optional uint32 mtu = 3;
+  optional uint32 keepalive_interval_secs = 4;
+  optional uint32 keepalive_timeout_secs = 5;
+}
+
+message UpdateTunnelResponse {
+  Tunnel tunnel = 1;
+}
+
 service TunnelService {
   rpc CreateTunnel(CreateTunnelRequest) returns (CreateTunnelResponse);
   rpc DeleteTunnel(DeleteTunnelRequest) returns (DeleteTunnelResponse);
   rpc GetTunnel(GetTunnelRequest) returns (GetTunnelResponse);
   rpc ListTunnels(ListTunnelsRequest) returns (ListTunnelsResponse);
+  rpc UpdateTunnel(UpdateTunnelRequest) returns (UpdateTunnelResponse);
   rpc WatchTunnels(WatchTunnelsRequest) returns (stream TunnelEvent);
 }
 

@@ -10,6 +10,7 @@ description = "gRPC service definitions for EoIP-rs"
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"
