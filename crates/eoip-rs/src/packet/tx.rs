@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use libc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -173,21 +174,77 @@ pub fn spawn_tx_batcher(
 }
 
 fn flush_batch(raw_fd: std::os::fd::RawFd, batch: &mut Vec<TxPacket>) {
-    for pkt in batch.drain(..) {
-        let data = pkt.buf.as_slice();
-        let dest = nix::sys::socket::SockaddrStorage::from(pkt.dest);
+    if batch.is_empty() {
+        return;
+    }
 
-        if let Err(e) = nix::sys::socket::sendto(raw_fd, data, &dest, nix::sys::socket::MsgFlags::empty()) {
-            match e {
-                nix::errno::Errno::EAGAIN | nix::errno::Errno::ENOBUFS => {
-                    // Drop packet under backpressure — correct behavior
-                }
-                _ => {
-                    tracing::error!(%e, "TX sendto failed");
-                }
+    let len = batch.len();
+
+    // Build iovec and sockaddr arrays — must outlive mmsghdr
+    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(len);
+    let mut addrs_v4: Vec<libc::sockaddr_in> = Vec::new();
+    let mut addrs_v6: Vec<libc::sockaddr_in6> = Vec::new();
+    // Track which addr type each message uses: false=v4, true=v6
+    let mut is_v6: Vec<bool> = Vec::with_capacity(len);
+
+    for pkt in batch.iter() {
+        let data = pkt.buf.as_slice();
+        iovecs.push(libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        });
+        match pkt.dest {
+            SocketAddr::V4(v4) => {
+                is_v6.push(false);
+                let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                addr.sin_family = libc::AF_INET as libc::sa_family_t;
+                addr.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                addrs_v4.push(addr);
+            }
+            SocketAddr::V6(v6) => {
+                is_v6.push(true);
+                let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                addr.sin6_addr.s6_addr = v6.ip().octets();
+                addrs_v6.push(addr);
             }
         }
     }
+
+    // Build mmsghdr array pointing into the stable vecs
+    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(len);
+    let mut v4_idx = 0usize;
+    let mut v6_idx = 0usize;
+    for (i, v6) in is_v6.iter().enumerate() {
+        let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        hdr.msg_hdr.msg_iov = &mut iovecs[i];
+        hdr.msg_hdr.msg_iovlen = 1;
+        if *v6 {
+            hdr.msg_hdr.msg_name = &mut addrs_v6[v6_idx] as *mut _ as *mut libc::c_void;
+            hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+            v6_idx += 1;
+        } else {
+            hdr.msg_hdr.msg_name = &mut addrs_v4[v4_idx] as *mut _ as *mut libc::c_void;
+            hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+            v4_idx += 1;
+        }
+        msgs.push(hdr);
+    }
+
+    // Single syscall for the entire batch
+    let sent = unsafe {
+        libc::sendmmsg(raw_fd, msgs.as_mut_ptr(), msgs.len() as u32, 0)
+    };
+
+    if sent < 0 {
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::ENOBUFS) => {}
+            _ => tracing::error!(%err, "TX sendmmsg failed"),
+        }
+    }
+
+    batch.clear();
 }
 
 /// Send a keepalive (zero-payload) packet for a tunnel.

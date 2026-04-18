@@ -168,16 +168,32 @@ impl TunnelManager {
             tunnel_cancel.clone(),
         );
 
-        // TAP writer — dedicated OS thread for zero-overhead channel → TAP delivery
+        // TAP writer — dedicated OS thread for zero-overhead channel → TAP delivery.
+        // Drains channel in batches to reduce contention, but writes one frame
+        // per syscall (TAP devices don't preserve frame boundaries with writev).
         if let Some(ref rx_recv) = handle.rx_receiver {
             let tap_fd = tap.as_fd().as_raw_fd();
             let rx = rx_recv.clone();
             std::thread::Builder::new()
                 .name(format!("tap-wr-{tunnel_id}"))
                 .spawn(move || {
+                    const MAX_BATCH: usize = 32;
+                    let mut bufs = Vec::with_capacity(MAX_BATCH);
+
                     while let Ok(buf) = rx.recv() {
-                        let data = buf.as_slice();
-                        unsafe { libc::write(tap_fd, data.as_ptr() as *const _, data.len()) };
+                        bufs.push(buf);
+                        // Drain more if available to reduce channel wake-ups
+                        while bufs.len() < MAX_BATCH {
+                            match rx.try_recv() {
+                                Ok(b) => bufs.push(b),
+                                Err(_) => break,
+                            }
+                        }
+
+                        for b in bufs.drain(..) {
+                            let data = b.as_slice();
+                            unsafe { libc::write(tap_fd, data.as_ptr() as *const _, data.len()) };
+                        }
                     }
                 })
                 .expect("failed to spawn TAP writer thread");

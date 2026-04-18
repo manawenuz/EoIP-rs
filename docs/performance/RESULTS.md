@@ -119,3 +119,57 @@ Validated via `eoip-cli` against live daemon at all scales:
 | linux-f | Client 5 | 167.235.250.191 | CX23 |
 
 All VMs in Hetzner `fsn1` datacenter, same private network `10.0.0.0/16`.
+
+## 9. Phase 11 — Userspace Performance Optimization
+
+**Date:** 2026-04-18
+**Platform:** Hetzner CPX22 (2 vCPU, 4 GB RAM, shared x86_64)
+**OS:** Ubuntu 22.04, Linux 5.15
+**Methodology:** Each version tested 3 times in rotating order (Latin square) to control for shared-vCPU variance. Results are averages.
+
+### Optimization Routes
+
+| Route | Change | Commit |
+|-------|--------|--------|
+| R1 | SO_RCVBUF/SO_SNDBUF set to 4 MB (was ~212 KB kernel default) | `da88e9c` |
+| R2 | R1 + `sendmmsg()` replacing per-packet `sendto()` loop in TX flush | `238b722` |
+| R3 | R1 + R2 + batch-drain crossbeam channel in TAP writer (up to 32 frames/wake) | `7e06a31` |
+
+### Throughput Results (3-round average, iperf3 single-stream TCP, 15s)
+
+| Version | TX (Mbps) | TX CPU | RX (Mbps) | RX CPU |
+|---------|-----------|--------|-----------|--------|
+| old (v0.1.0-alpha.1) | 369 | 1.1% | 279 | 20.7% |
+| R1 (4 MB bufs) | 554 | 1.8% | 473 | 26.5% |
+| R2 (R1 + sendmmsg) | 516 | 1.8% | 436 | 21.4% |
+| **R3 (all routes)** | **570** | **1.6%** | **456** | **24.9%** |
+
+### Improvement vs v0.1.0-alpha.1
+
+| Metric | Old | R3 | Improvement |
+|--------|-----|-----|------------|
+| TX throughput | 369 Mbps | 570 Mbps | **+54%** |
+| RX throughput | 279 Mbps | 456 Mbps | **+63%** |
+
+### Cross-Compatibility
+
+| Config | TX (Mbps) | RX (Mbps) | Status |
+|--------|-----------|-----------|--------|
+| R3 + R3 | 570 | 456 | Pass |
+| R3 + old | 412 | 456 | Pass |
+| old + R3 | 477 | 270 | Pass |
+| old + old | 369 | 279 | Pass |
+
+Full backward compatibility maintained.
+
+### MikroTik CHR Interop (RouterOS 7.18.2)
+
+| Test | Result |
+|------|--------|
+| Tunnel establishment | CHR shows `R` (running) |
+| Bidirectional ping | 0% loss, ~0.6 ms RTT |
+| Large frame ping (1400 bytes) | 0% loss |
+| btest TX (EoIP-rs → CHR) | 229 Mbps avg (TCP) |
+| btest RX (CHR → EoIP-rs) | ~1 Mbps (CHR free license cap) |
+
+Protocol compatibility confirmed. RX bandwidth limited by CHR free license (1 Mbps cap), not by EoIP-rs.

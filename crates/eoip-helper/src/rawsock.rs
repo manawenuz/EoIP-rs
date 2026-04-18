@@ -24,6 +24,11 @@ pub fn create_raw_socket_v4() -> Result<OwnedFd, EoipError> {
     let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(PROTO_GRE)))?;
     sock.set_nonblocking(true)?;
 
+    // Enlarge socket buffers to absorb bursts between userspace batch drains.
+    // Default ~212 KB is too small under sustained iperf3 load.
+    sock.set_recv_buffer_size(4 * 1024 * 1024)?;
+    sock.set_send_buffer_size(4 * 1024 * 1024)?;
+
     // IP_HDRINCL = false (default) — kernel prepends IP header on TX,
     // but we receive the full IP header on RX for raw sockets.
 
@@ -49,7 +54,7 @@ pub fn create_raw_socket_v4() -> Result<OwnedFd, EoipError> {
         }
     }
 
-    tracing::info!("created raw socket: AF_INET, SOCK_RAW, proto=47 (EoIP), ttl=255, df=0");
+    tracing::info!("created raw socket: AF_INET, SOCK_RAW, proto=47 (EoIP), ttl=255, df=0, bufs=4MB");
     Ok(OwnedFd::from(sock))
 }
 
@@ -66,9 +71,13 @@ pub fn create_raw_socket_v6() -> Result<OwnedFd, EoipError> {
     sock.set_only_v6(true)?;
     sock.set_nonblocking(true)?;
 
+    // Enlarge socket buffers to absorb bursts between userspace batch drains.
+    sock.set_recv_buffer_size(4 * 1024 * 1024)?;
+    sock.set_send_buffer_size(4 * 1024 * 1024)?;
+
     // Match MikroTik hop limit of 255 (IPv6 equivalent of TTL).
     sock.set_unicast_hops_v6(255)?;
 
-    tracing::info!("created raw socket: AF_INET6, SOCK_RAW, proto=97 (EtherIP), hops=255");
+    tracing::info!("created raw socket: AF_INET6, SOCK_RAW, proto=97 (EtherIP), hops=255, bufs=4MB");
     Ok(OwnedFd::from(sock))
 }
