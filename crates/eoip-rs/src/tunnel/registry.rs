@@ -35,9 +35,16 @@ impl TunnelRegistry {
         self.map.remove(key)
     }
 
-    /// Look up a tunnel by demux key (used on the RX hot path).
+    /// Look up a tunnel by demux key (clones Arc — use `get_ref` on hot paths).
     pub fn get(&self, key: &DemuxKey) -> Option<Arc<TunnelHandle>> {
         self.map.get(key).map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Look up a tunnel by demux key, returning a borrow guard (no Arc clone).
+    /// Holds a DashMap shard read-lock for the guard's lifetime — keep it short.
+    #[inline]
+    pub fn get_ref(&self, key: &DemuxKey) -> Option<dashmap::mapref::one::Ref<'_, DemuxKey, Arc<TunnelHandle>>> {
+        self.map.get(key)
     }
 
     /// Number of registered tunnels.

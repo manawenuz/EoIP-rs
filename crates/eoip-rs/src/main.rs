@@ -81,7 +81,11 @@ async fn run(args: Args) -> Result<(), DaemonError> {
     // Bootstrap: create first tunnel from config to get raw socket fds
     let mut raw_v4_fd: Option<OwnedFd> = None;
     let mut raw_v6_fd: Option<OwnedFd> = None;
-    let pool = Arc::new(BufferPool::new(config.performance.channel_buffer));
+    // Pool size: channel depth + recvmmsg batch headroom per RX worker + margin
+    let pool_size = config.performance.channel_buffer * config.tunnels.len().max(1)
+        + 32 * 4  // RECV_BATCH * num_rx_workers
+        + 256;    // margin
+    let pool = Arc::new(BufferPool::new(pool_size));
     let (tx_sender, tx_receiver) = mpsc::channel::<TxPacket>(config.performance.channel_buffer);
 
     // Create initial tunnels from config (gets raw sockets from first tunnel)
@@ -92,7 +96,10 @@ async fn run(args: Args) -> Result<(), DaemonError> {
             continue;
         }
 
-        let handle = Arc::new(eoip_rs::tunnel::handle::TunnelHandle::new(tunnel_cfg.clone()));
+        let handle = Arc::new(eoip_rs::tunnel::handle::TunnelHandle::with_channel_cap(
+            tunnel_cfg.clone(),
+            config.performance.channel_buffer,
+        ));
         let key = eoip_proto::DemuxKey {
             tunnel_id: tunnel_cfg.tunnel_id,
             peer_addr: tunnel_cfg.remote,
@@ -171,6 +178,7 @@ async fn run(args: Args) -> Result<(), DaemonError> {
         Arc::clone(&registry),
         Arc::clone(&pool),
         shutdown.token().clone(),
+        config.performance.rx_workers,
     );
     tracing::info!("RX pipeline started");
 

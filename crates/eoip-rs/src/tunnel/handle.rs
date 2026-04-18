@@ -11,7 +11,6 @@ use crate::tunnel::lifecycle::AtomicTunnelState;
 mod unix_fields {
     pub use crossbeam::channel::{self, Receiver, Sender};
     pub use crate::packet::buffer::PacketBuf;
-    pub const RX_CHANNEL_CAP: usize = 1024;
 }
 
 /// Runtime handle for a single tunnel, stored in the `TunnelRegistry`.
@@ -30,10 +29,15 @@ pub struct TunnelHandle {
 
 impl TunnelHandle {
     pub fn new(config: TunnelConfig) -> Self {
+        Self::with_channel_cap(config, 1024)
+    }
+
+    /// Create a handle with a specific RX channel capacity.
+    pub fn with_channel_cap(config: TunnelConfig, channel_cap: usize) -> Self {
         use crate::tunnel::lifecycle::TunnelState;
 
         #[cfg(unix)]
-        let (tx, rx) = unix_fields::channel::bounded(unix_fields::RX_CHANNEL_CAP);
+        let (tx, rx) = unix_fields::channel::bounded(channel_cap);
 
         Self {
             config,
