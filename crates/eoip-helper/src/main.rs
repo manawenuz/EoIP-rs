@@ -229,15 +229,27 @@ fn handle_create_tunnel(
     }
 
     if !*raw_v6_created {
-        let raw_v6 = rawsock::create_raw_socket_v6()?;
-        fdpass::send_msg_with_fd(
-            sock,
-            &HelperMsg::RawSocket {
-                address_family: AF_INET6,
-            },
-            raw_v6.as_fd(),
-        )?;
-        *raw_v6_created = true;
+        match rawsock::create_raw_socket_v6() {
+            Ok(raw_v6) => {
+                fdpass::send_msg_with_fd(
+                    sock,
+                    &HelperMsg::RawSocket {
+                        address_family: AF_INET6,
+                    },
+                    raw_v6.as_fd(),
+                )?;
+                *raw_v6_created = true;
+            }
+            Err(e) => {
+                tracing::warn!("IPv6 raw socket not available: {e} (non-critical, IPv4 tunnels unaffected)");
+                let _ = fdpass::send_msg(
+                    sock,
+                    &HelperMsg::Error {
+                        msg: format!("IPv6 raw socket: {e}"),
+                    },
+                );
+            }
+        }
     }
 
     Ok(())
