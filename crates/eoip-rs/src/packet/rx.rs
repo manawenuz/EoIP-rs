@@ -331,6 +331,44 @@ fn try_rx_loop_recvmmsg(
     true
 }
 
+/// EoIP (IPv4) receive loop using AF_PACKET + TPACKET_V3 ring buffer.
+///
+/// Zero-copy path: kernel writes packets directly into mmap'd ring buffer.
+/// We process blocks in-place, calling `process_v4_packet()` with IP data
+/// from `tp_net` offset (L2 header already skipped by the ring abstraction).
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn rx_loop_v4_mmap(
+    af_packet_fd: std::os::fd::RawFd,
+    registry: &TunnelRegistry,
+    pool: &BufferPool,
+    shutdown: &CancellationToken,
+) {
+    use crate::packet::packet_mmap::PacketMmapRing;
+
+    let mut ring = match PacketMmapRing::new(af_packet_fd) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "failed to set up PACKET_MMAP ring");
+            return;
+        }
+    };
+
+    tracing::info!("RX v4 PACKET_MMAP worker started");
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        ring.process_block(1000, |data, data_len| {
+            process_v4_packet(data, data_len, registry, pool);
+        });
+    }
+
+    tracing::info!("RX v4 PACKET_MMAP worker stopped");
+}
+
 /// EoIPv6 (IPv6, protocol 97) receive loop.
 ///
 /// Uses `recvfrom()` instead of `read()` to obtain the source IPv6 address,
