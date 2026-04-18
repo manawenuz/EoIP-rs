@@ -72,10 +72,16 @@ pub fn print_detail(tunnels: &[Tunnel]) {
             "      remote-address={} mtu={} actual-mtu={} keepalive={}s,{}s",
             t.remote_addr, t.mtu, t.actual_mtu, t.keepalive_interval_secs, t.keepalive_timeout_secs
         );
+        let ipsec_str = if t.ipsec_secret.is_empty() {
+            "ipsec=no".to_string()
+        } else {
+            format!("ipsec=yes ipsec-active={}", if t.ipsec_active { "yes" } else { "no" })
+        };
         println!(
-            "      enabled={} state={}",
+            "      enabled={} state={} {}",
             if t.enabled { "yes" } else { "no" },
-            state_name(t)
+            state_name(t),
+            ipsec_str
         );
         println!();
     }

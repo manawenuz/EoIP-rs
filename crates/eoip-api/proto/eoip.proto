@@ -15,6 +15,8 @@ message Tunnel {
   uint32 keepalive_interval_secs = 8;
   uint32 keepalive_timeout_secs = 9;
   uint32 actual_mtu = 10;
+  string ipsec_secret = 11;
+  bool ipsec_active = 12;
 }
 
 enum TunnelState {
@@ -70,6 +72,7 @@ message CreateTunnelRequest {
   string remote_addr = 3;
   string iface_name = 4;
   uint32 mtu = 5;
+  string ipsec_secret = 6;
 }
 
 message CreateTunnelResponse {

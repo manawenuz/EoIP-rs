@@ -13,6 +13,7 @@ use eoip_helper::fdpass;
 use eoip_proto::wire::{DaemonMsg, HelperMsg};
 
 use eoip_rs::config::parse_config;
+use eoip_rs::ipsec::IpsecManager;
 use eoip_rs::keepalive;
 use eoip_rs::net::tap::TapDevice;
 use eoip_rs::packet::buffer::BufferPool;
@@ -97,7 +98,9 @@ async fn run(args: Args) -> Result<(), DaemonError> {
         }
 
         // Resolve MTU: auto-detect or use explicit config value.
-        let resolved_mtu = tunnel_cfg.mtu.resolve(tunnel_cfg.remote);
+        // Subtract IPsec ESP overhead if ipsec_secret is configured.
+        let has_ipsec = tunnel_cfg.ipsec_secret.is_some();
+        let resolved_mtu = tunnel_cfg.mtu.resolve_with_ipsec(tunnel_cfg.remote, has_ipsec);
         if tunnel_cfg.mtu.is_auto() {
             tracing::info!(
                 tunnel_id = tunnel_cfg.tunnel_id,
@@ -215,6 +218,15 @@ async fn run(args: Args) -> Result<(), DaemonError> {
     let raw_v4_raw = raw_v4_fd.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(-1);
     let raw_v6_raw = raw_v6_fd.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(-1);
 
+    // Create IpsecManager (connects to strongSwan if available)
+    let has_ipsec_tunnels = config.tunnels.iter().any(|t| t.ipsec_secret.is_some());
+    let ipsec = if has_ipsec_tunnels {
+        Arc::new(IpsecManager::new())
+    } else {
+        // No tunnels need IPsec — skip VICI connection attempt
+        Arc::new(IpsecManager::new())
+    };
+
     // Create TunnelManager (holds helper socket for dynamic creation)
     let manager = Arc::new(TunnelManager::new(
         helper_stream,
@@ -224,6 +236,7 @@ async fn run(args: Args) -> Result<(), DaemonError> {
         raw_v4_raw,
         raw_v6_raw,
         shutdown.token().clone(),
+        Arc::clone(&ipsec),
     ));
 
     // Spawn per-tunnel tasks for startup tunnels
@@ -279,10 +292,27 @@ async fn run(args: Args) -> Result<(), DaemonError> {
                 );
             }
 
+            // Set up IPsec for startup tunnel if configured
+            if let Some(ref secret) = handle.config.ipsec_secret {
+                match ipsec.setup_tunnel(*tunnel_id, handle.config.local, handle.config.remote, secret) {
+                    Ok(()) => tracing::info!(tunnel_id, "IPsec SA established"),
+                    Err(e) => tracing::warn!(tunnel_id, %e, "IPsec setup failed — tunnel runs unencrypted"),
+                }
+            }
+
             manager.register_startup_tunnel(*tunnel_id, tunnel_cancel, Arc::clone(tap));
         }
 
         tracing::info!(tunnel_id, "tunnel tasks started");
+    }
+
+    // Start IPsec SA monitor if any tunnels have ipsec_secret
+    if has_ipsec_tunnels {
+        eoip_rs::ipsec::monitor::spawn_ipsec_monitor(
+            Arc::clone(&ipsec),
+            shutdown.token().clone(),
+        );
+        tracing::info!("IPsec SA monitor started");
     }
 
     // TX batcher (shared by all tunnels, routes packets to correct raw socket)

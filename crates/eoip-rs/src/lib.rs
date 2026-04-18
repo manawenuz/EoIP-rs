@@ -4,6 +4,8 @@
 pub mod api;
 pub mod config;
 #[cfg(unix)]
+pub mod ipsec;
+#[cfg(unix)]
 pub mod keepalive;
 pub mod net;
 #[cfg(unix)]

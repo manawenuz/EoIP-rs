@@ -17,8 +17,8 @@ pub fn execute_local(cmd: Command) {
 pub async fn execute(client: &mut GrpcClient, cmd: Command, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Command::Print { detail, filter } => cmd_print(client, detail, filter, json).await,
-        Command::Add { tunnel_id, remote, local, name, mtu } => {
-            cmd_add(client, tunnel_id, remote, local, name, mtu, json).await
+        Command::Add { tunnel_id, remote, local, name, mtu, ipsec_secret } => {
+            cmd_add(client, tunnel_id, remote, local, name, mtu, ipsec_secret, json).await
         }
         Command::Remove { tunnel_id } => cmd_remove(client, tunnel_id).await,
         Command::Enable { tunnel_id } => cmd_enable_disable(client, tunnel_id, true, json).await,
@@ -66,6 +66,7 @@ async fn cmd_add(
     local: Option<String>,
     name: Option<String>,
     mtu: Option<u32>,
+    ipsec_secret: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let req = CreateTunnelRequest {
@@ -74,6 +75,7 @@ async fn cmd_add(
         remote_addr: remote,
         iface_name: name.unwrap_or_else(|| format!("eoip{tunnel_id}")),
         mtu: mtu.unwrap_or(0), // 0 = auto-detect
+        ipsec_secret: ipsec_secret.unwrap_or_default(),
     };
     let resp = client.tunnels.create_tunnel(req).await?;
     let tunnel = resp.into_inner().tunnel.unwrap();
@@ -215,7 +217,7 @@ fn print_help() {
     println!("  print                          List all tunnels");
     println!("  print detail                   Detailed tunnel view");
     println!("  print where tunnel-id=<id>     Filter by tunnel ID");
-    println!("  add tunnel-id=<id> remote-address=<ip> [name=<n>] [local-address=<ip>] [mtu=<m>]");
+    println!("  add tunnel-id=<id> remote-address=<ip> [name=<n>] [local-address=<ip>] [mtu=<m>] [ipsec-secret=<s>]");
     println!("  remove <tunnel-id>             Delete a tunnel");
     println!("  enable <tunnel-id>             Enable a tunnel");
     println!("  disable <tunnel-id>            Disable a tunnel");
