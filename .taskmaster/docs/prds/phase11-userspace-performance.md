@@ -143,38 +143,61 @@ TAP writer thread now drains up to 32 frames per channel wake-up. Note: `writev(
 
 Three bugs fixed: `IPV6_V6ONLY` invalid on raw sockets (EINVAL), TX batcher missing v6 fd, RX v6 using `read()` instead of `recvfrom()` (no source address for demux).
 
+### Route 5: RX Hot-Path Micro-Optimizations — DONE ✓
+
+**Commit:** `901bcc9` | **Impact:** +64% TX, +50% RX vs pre-Route5
+
+Six changes: DashMap Ref guard (no Arc clone), buffer shrink 65KB→2KB, CLOCK_REALTIME_COARSE via vDSO, rx_workers config wiring, RX channel cap config wiring, proper pool sizing. The buffer shrink and Arc clone elimination were the primary drivers — better cache locality and fewer atomics per packet.
+
+**3-round Latin square benchmark (Hetzner CPX22):**
+
+| Version | TX avg (Mbps) | RX avg (Mbps) |
+|---------|-------------|-------------|
+| pre-Route5 | 430 | 416 |
+| **Route 5** | **704** (+64%) | **623** (+50%) |
+
+---
+
+## Post-Mortem: Route 6 — Zero-Copy RX into Pool Buffers
+
+### What Was Attempted
+
+Eliminate the `copy_from_slice` per RX packet by receiving `recvmmsg` data directly into pool buffers. Added `raw_mut()`, `as_raw_slice()`, `set_rx_region()` to `PacketBuf`. On successful decode, swap a fresh buffer in, set the received buffer's head/len to the Ethernet frame region, and send to TAP writer — zero memcpy.
+
+### What Happened
+
+**Branch:** `feat/route6-zerocopy-rx` (not merged, abandoned)
+
+Benchmarked in same Latin square as Route 5. Results:
+
+| Version | TX avg (Mbps) | RX avg (Mbps) | RX CPU |
+|---------|-------------|-------------|--------|
+| Route 5 | 704 | 623 | 29.3% |
+| Route 5+6 | 673 | 567 | 32.0% |
+
+Route 6 made things **slightly worse** — lower throughput and higher CPU.
+
+### Why It Didn't Help
+
+1. **The memcpy it eliminates is cheap.** A 1500-byte copy fits in L1 cache (~32KB). At the speeds we operate (~700 Mbps), this is ~60K copies/sec of hot cache lines. Cost: negligible.
+2. **The machinery it adds is expensive.** Per-packet `mem::swap` of `PacketBuf` structs + iovec pointer relinking + mmsghdr update adds branches and pointer chasing that aren't free.
+3. **DashMap shard lock held longer.** The zero-copy path does the swap while holding the `get_ref()` guard, extending the shard lock duration vs the copy path which drops the guard before pool operations.
+
+### Key Learning
+
+**Don't optimize memcpy of hot cache lines.** The 1500-byte frame copy is L1-resident and essentially free. The overhead of avoiding it (buffer lifecycle management, pointer juggling) exceeds the copy cost. This applies broadly: zero-copy only wins when the copy is large (>4KB) or crosses cache/NUMA boundaries. For MTU-sized Ethernet frames in a tight loop, the copy is the right choice.
+
+**DO NOT retry this route.** The implementation was clean and correct — the approach is fundamentally wrong for this workload.
+
 ---
 
 ## Remaining Optimization Routes
-
-### Route 5: RX Hot-Path Micro-Optimizations (Low Risk, Low-Medium Impact)
-
-Code audit identified several per-packet inefficiencies in the RX hot path. Each is small, but they compound at high packet rates.
-
-| # | Optimization | File:Line | Risk | Est. Impact |
-|---|-------------|-----------|------|-------------|
-| 5a | **Avoid Arc clone per RX packet** — `registry.get()` clones Arc on every packet (2 atomic ops). Use `DashMap::get()` Ref guard directly. | `rx.rs:150` | Low | ~2 atomics/pkt |
-| 5b | **Shrink recvmmsg buffers** — 32 x 65536 = 2 MB heap per RX thread. Max EoIP frame is ~1542 bytes. Use ~2048-byte buffers for better cache locality. | `rx.rs:233` | Low | Cache hits |
-| 5c | **Use CLOCK_MONOTONIC_COARSE** — `SystemTime::now()` is a syscall. `CLOCK_MONOTONIC_COARSE` is vDSO (~4ns). Called every 64 packets. | `rx.rs:109` | Low | Fewer syscalls |
-| 5d | **Wire up `rx_workers` config** — Config defines `rx_workers` (default 1) but code hardcodes 2 v4 workers. | `rx.rs:46`, `config.rs:92` | Low | Config works |
-| 5e | **Wire up RX channel cap to config** — `RX_CHANNEL_CAP=1024` is hardcoded, ignores `PerformanceConfig.channel_buffer`. | `handle.rs:14` | Trivial | Config works |
-| 5f | **Size buffer pool properly** — Pool sized to `channel_buffer` (1024). Under sustained load with 2 RX threads + channel depth, pool exhaustion triggers heap fallback. | `main.rs:84` | Low | Fewer allocs |
-
-### Route 6: Receive Directly into Pool Buffers (Medium Risk, Medium Impact)
-
-**Current state:** `recvmmsg` receives into 65KB scratch buffers, then `process_v4_packet` copies the frame data into a pool buffer via `copy_from_slice`. This is one memcpy per RX packet that could be eliminated.
-
-**Proposed:** Pre-allocate pool buffers for the iovec array, receive directly into pool buffer payload areas. After decode, send the buffer to the TAP writer without copying.
-
-**Expected impact:** Eliminates one memcpy per RX packet (~1500 bytes). At 500K pps, this is ~750 MB/s of unnecessary memory bandwidth.
-
-**Complexity:** Medium. Buffer lifecycle changes — pool buffers must be returned if the packet is dropped (bad magic, demux miss, keepalive). Headroom management needs care.
 
 ### Route 4: AF_PACKET + PACKET_MMAP (High Risk, High Impact)
 
 **Status:** Failed attempt on `feat/packet-mmap-wip`. See Post-Mortem above. Last resort.
 
-**Prerequisite:** All Route 5 and Route 6 optimizations should be exhausted first. Then validate `PACKET_IGNORE_OUTGOING` + simple BPF + SOCK_RAW + TPACKET_V3 in a standalone test program before integrating.
+**Prerequisite:** Validate `PACKET_IGNORE_OUTGOING` + simple BPF + SOCK_RAW + TPACKET_V3 in a standalone test program before integrating.
 
 ### Route 7: Needs Research / Future
 
@@ -192,20 +215,18 @@ Code audit identified several per-packet inefficiencies in the RX hot path. Each
 
 ## Implementation Order (Remaining)
 
-1. **Route 5a-5f** (low risk micro-opts) — batch of 6 trivial-low changes, then full UAT
-2. **Route 6** (zero-copy RX into pool buffers) — medium risk, full UAT after
-3. **Route 4** (PACKET_MMAP revisit) — high risk, standalone validation first
-4. **Route 7** (io_uring / XDP) — future, requires architecture changes
+1. **Route 4** (PACKET_MMAP revisit) — high risk, standalone validation first
+2. **Route 7** (io_uring / XDP / GRO) — future, requires architecture changes or kernel upgrades
 
 ---
 
 ## Success Criteria
 
-| Metric | Pre-opt (alpha.1) | Current (alpha.3) | Target | Stretch |
+| Metric | Pre-opt (alpha.1) | Current (Route 5) | Target | Stretch |
 |--------|-------------------|--------------------|--------|---------|
-| TX throughput | 369 Mbps | **570 Mbps** ✓ | 600 Mbps | Link-speed |
-| RX throughput | 279 Mbps | **456 Mbps** ✓ | 550 Mbps | Link-speed |
-| RX CPU (per Gbps) | ~74% | ~55% | < 35% | < 20% |
+| TX throughput | 369 Mbps | **704 Mbps** ✓ | 800 Mbps | Link-speed |
+| RX throughput | 279 Mbps | **623 Mbps** ✓ | 700 Mbps | Link-speed |
+| RX CPU (per Gbps) | ~74% | ~47% | < 35% | < 20% |
 | Latency overhead | ~190 us | ~190 us | < 150 us | < 100 us |
 | Cross-compat | Full | **Full** ✓ | Full | Full |
 | IPv6 transport | Broken | **Working** ✓ | Working | Working |
