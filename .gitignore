@@ -28,4 +28,7 @@ node_modules/
 
 # Task files
 # tasks.json
-# tasks/ 
+# tasks/
+
+# Test lab environment (contains VM IPs and infra details)
+test-lab/env.sh
