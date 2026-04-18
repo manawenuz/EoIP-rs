@@ -102,6 +102,7 @@ mod tests {
             keepalive_interval_secs: 10,
             keepalive_timeout_secs: 30,
             clamp_tcp_mss: true,
+            ipsec_secret: None,
         }))
     }
 

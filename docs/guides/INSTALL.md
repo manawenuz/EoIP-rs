@@ -33,6 +33,7 @@ sudo ./scripts/install-linux.sh
 - Rust 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - protoc (`apt install protobuf-compiler` or download from [GitHub](https://github.com/protocolbuffers/protobuf/releases))
 - C compiler (`apt install build-essential`)
+- strongSwan (optional, for IPsec): `apt install strongswan-charon strongswan-swanctl`
 
 ```bash
 git clone https://github.com/manawenuz/EoIP-rs.git
@@ -182,6 +183,7 @@ See [config/eoip-rs.example.toml](../../config/eoip-rs.example.toml) for a fully
 tunnel_id = 100
 local = "192.168.1.10"
 remote = "192.168.1.1"
+# ipsec_secret = "SecretPass"   # optional, requires strongSwan
 ```
 
 All other fields have sensible defaults (MTU 1458, keepalive 10s/100s, helper socket `/run/eoip-rs/helper.sock`).
@@ -213,4 +215,5 @@ iface_name = "eoip-dc2"
 | `mtu` | 1458 | Tunnel interface MTU |
 | `keepalive_interval_secs` | 10 | Keepalive send interval |
 | `keepalive_timeout_secs` | 100 | Time before declaring tunnel stale |
+| `ipsec_secret` | (none) | Pre-shared key for IPsec encryption (requires strongSwan) |
 | `api.listen` | `[::1]:50051` | gRPC API bind address |

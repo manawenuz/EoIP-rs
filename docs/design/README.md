@@ -7,7 +7,7 @@ EoIP-rs is a **userspace** EoIP (Ethernet over IP) and EoIPv6 implementation in 
 ## Non-Goals
 
 - **Kernel module**: This is intentionally userspace for portability and safety.
-- **Built-in encryption**: Security is delegated to the underlying VPN transport.
+- **Built-in encryption beyond IPsec**: Full encryption is delegated to the underlying VPN transport. Optional `ipsec-secret` provides MikroTik-compatible ESP encryption via strongSwan for interop scenarios.
 - **MPLS/VPLS**: Only point-to-point L2 tunnels, not multipoint.
 - **Routing**: EoIP-rs bridges Ethernet frames, it does not route IP packets.
 
@@ -32,7 +32,7 @@ EoIP-rs is a **userspace** EoIP (Ethernet over IP) and EoIPv6 implementation in 
 | 3 | Platform priority | Linux first | Best TAP/L2 support; macOS/Windows/Android incremental |
 | 4 | Dual-stack | Full (IPv4/IPv6 any combination) | MikroTik supports both; users need flexibility |
 | 5 | Performance target | Balanced (adaptive batching) | Sub-ms latency idle, high throughput under load |
-| 6 | Encryption | None (VPN handles it) | Avoids complexity; EoIP is always inside a VPN tunnel |
+| 6 | Encryption | Optional IPsec (`ipsec-secret`) + VPN recommended | MikroTik-compatible IKEv1/ESP via strongSwan VICI; VPN still recommended for general use |
 | 7 | Privilege model | Separation (root helper + unprivileged daemon) | Minimizes attack surface of the packet-processing daemon |
 | 8 | Socket model | Shared raw socket + userspace demux | Scales to thousands of tunnels with 2 FDs total |
 | 9 | Management API | gRPC (tonic) with streaming | Strongly typed, streaming for live events, good tooling |
@@ -40,10 +40,10 @@ EoIP-rs is a **userspace** EoIP (Ethernet over IP) and EoIPv6 implementation in 
 
 ## Reference Implementations
 
-- [amphineko/eoip](https://github.com/amphineko/eoip) — Linux kernel module, MikroTik-compatible, GRE demux patch
-- [bbonev/eoip](https://github.com/bbonev/eoip) — Linux kernel module, actively maintained, netlink management
-- [agustim/openwrt-linux-eoip](https://github.com/agustim/openwrt-linux-eoip) — OpenWrt package wrapper for userspace linux-eoip
+- [amphineko/eoip](https://github.com/amphineko/eoip) -- Linux kernel module, MikroTik-compatible, GRE demux patch
+- [bbonev/eoip](https://github.com/bbonev/eoip) -- Linux kernel module, actively maintained, netlink management
+- [agustim/openwrt-linux-eoip](https://github.com/agustim/openwrt-linux-eoip) -- OpenWrt package wrapper for userspace linux-eoip
 
 ## MikroTik EoIP Protocol
 
-MikroTik's EoIP is a proprietary Layer 2 tunneling protocol that encapsulates Ethernet frames inside a non-standard GRE header (IP protocol 47). MikroTik also supports EoIPv6 using EtherIP (IP protocol 97, RFC 3378) with a MikroTik-specific tunnel ID encoding. Neither protocol is formally specified — the wire format was reverse-engineered from packet captures.
+MikroTik's EoIP is a proprietary Layer 2 tunneling protocol that encapsulates Ethernet frames inside a non-standard GRE header (IP protocol 47). MikroTik also supports EoIPv6 using EtherIP (IP protocol 97, RFC 3378) with a MikroTik-specific tunnel ID encoding. Neither protocol is formally specified -- the wire format was reverse-engineered from packet captures.

@@ -52,6 +52,8 @@ impl TunnelServiceImpl {
             keepalive_interval_secs: handle.config.keepalive_interval_secs as u32,
             keepalive_timeout_secs: handle.config.keepalive_timeout_secs as u32,
             actual_mtu: if actual > 0 { actual as u32 } else { configured_mtu as u32 },
+            ipsec_secret: if handle.config.ipsec_secret.is_some() { "***".to_string() } else { String::new() },
+            ipsec_active: false, // TODO: populate from IpsecManager
         }
     }
 }
@@ -83,6 +85,7 @@ impl tunnel_service_server::TunnelService for TunnelServiceImpl {
             keepalive_interval_secs: 10,
             keepalive_timeout_secs: 100,
             clamp_tcp_mss: true,
+            ipsec_secret: if req.ipsec_secret.is_empty() { None } else { Some(req.ipsec_secret) },
         };
 
         self.manager.create_tunnel(config).await

@@ -6,23 +6,24 @@ Creates Layer 2 Ethernet tunnels over IP networks using the same wire format as 
 
 ```
                     EoIP Tunnel (IP Protocol 47)
-  ┌──────────┐  ◄──────────────────────────────►  ┌──────────┐
-  │ EoIP-rs  │        Ethernet frames              │ MikroTik │
-  │ (Linux)  │        encapsulated in GRE           │ RouterOS │
-  │ eoip100  │                                      │ eoip-tun │
-  └──────────┘                                      └──────────┘
+  +----------+  <------------------------------>  +----------+
+  | EoIP-rs  |        Ethernet frames              | MikroTik |
+  | (Linux)  |        encapsulated in GRE           | RouterOS |
+  | eoip100  |                                      | eoip-tun |
+  +----------+                                      +----------+
    10.255.0.2                                        10.255.0.1
 ```
 
 ## Features
 
-- **MikroTik wire-compatible** — byte-identical EoIP GRE headers, validated against RouterOS 7.18.2
-- **MikroTik-style CLI** — `eoip-cli` with RouterOS-inspired command syntax
-- **Dynamic tunnel management** — add/remove tunnels at runtime via gRPC API
-- **High performance** — lock-free DashMap demux, zero-copy buffer pool, adaptive batching
-- **100-tunnel scaling** — tested with 100 concurrent tunnels, 17 MB RSS
-- **Cross-platform** — Linux (full), Windows (preview), macOS (planned)
-- **Protocol analyzer** — decode and inspect EoIP pcap captures
+- **MikroTik wire-compatible** -- byte-identical EoIP GRE headers, validated against RouterOS 7.18.2
+- **MikroTik-style CLI** -- `eoip-cli` with RouterOS-inspired command syntax
+- **Dynamic tunnel management** -- add/remove tunnels at runtime via gRPC API
+- **High performance** -- lock-free DashMap demux, zero-copy buffer pool, adaptive batching
+- **100-tunnel scaling** -- tested with 100 concurrent tunnels, 17 MB RSS
+- **IPsec encryption** -- optional `ipsec-secret` for MikroTik-compatible ESP encryption via strongSwan
+- **Cross-platform** -- Linux (full), Windows (preview), macOS (planned)
+- **Protocol analyzer** -- decode and inspect EoIP pcap captures
 
 ## Quick Start
 
@@ -72,6 +73,7 @@ listen = "[::1]:50051"
 tunnel_id = 100
 local = "192.168.1.10"       # Your Linux IP
 remote = "192.168.1.1"       # MikroTik IP
+# ipsec_secret = "SecretPass"  # Optional: MikroTik-compatible IPsec encryption
 ```
 
 ### 2. Start
@@ -147,11 +149,16 @@ graph TB
 
     subgraph "eoip-rs daemon"
         REG[Tunnel Registry<br/>DashMap]
-        RX[RX Path<br/>raw socket → decode → TAP]
-        TX[TX Path<br/>TAP → encode → raw socket]
+        RX[RX Path<br/>raw socket -> decode -> TAP]
+        TX[TX Path<br/>TAP -> encode -> raw socket]
         KA[Keepalive FSM]
         API[gRPC API<br/>tonic]
         MGR[Tunnel Manager]
+        IPSEC[IPsec Manager<br/>VICI protocol]
+    end
+
+    subgraph "External"
+        SW[strongSwan<br/>IKE daemon]
     end
 
     subgraph "eoip-cli"
@@ -170,6 +177,8 @@ graph TB
     CLI -->|gRPC| API
     API --> MGR
     MGR -->|CreateTunnel| TAP
+    MGR -->|ipsec_secret| IPSEC
+    IPSEC -->|VICI| SW
 ```
 
 ### Crate Structure
@@ -193,14 +202,16 @@ sequenceDiagram
     participant RX as RX Path
     participant PEER as Remote Peer
 
-    Note over TAP,PEER: TX: Local → Remote
+    Note over TAP,PEER: TX: Local -> Remote
     TAP->>TX: Ethernet frame
     TX->>TX: Prepend EoIP header
     TX->>NET: IP proto 47 (GRE)
-    NET->>PEER: EoIP packet
+    Note over NET: If IPsec active:<br/>kernel XFRM encrypts GRE->ESP
+    NET->>PEER: GRE packet (or ESP-encrypted)
 
-    Note over TAP,PEER: RX: Remote → Local
-    PEER->>NET: EoIP packet
+    Note over TAP,PEER: RX: Remote -> Local
+    PEER->>NET: GRE packet (or ESP-encrypted)
+    Note over NET: If IPsec active:<br/>kernel XFRM decrypts ESP->GRE
     NET->>RX: IP proto 47
     RX->>RX: Decode + DashMap demux
     RX->>TAP: Ethernet frame
@@ -218,19 +229,21 @@ Tested on Hetzner CX23 (2 vCPU, 4 GB RAM):
 | Memory (100 tunnels) | 17.6 MB RSS |
 | Concurrent tunnels | 100 (all active, 0% loss) |
 | MikroTik interop | Wire-format identical, 0% loss |
+| IPsec throughput (AES-256-CBC) | ~230 Mbps encrypted |
 
 Full results: [docs/performance/RESULTS.md](docs/performance/RESULTS.md)
 
 ## Documentation
 
-- **[Installation Guide](docs/guides/INSTALL.md)** — Binary install, compile from source, systemd setup
-- **[MikroTik Setup Guide](docs/guides/MIKROTIK.md)** — Configure MikroTik side for interop
-- **[CLI Guide](docs/guides/CLI.md)** — Full CLI command reference
-- **[PMTUD & Auto-MTU](docs/guides/PMTUD.md)** — Path MTU discovery, auto-detection, TCP MSS clamping
-- **[Networking Guide](docs/guides/NETWORKING.md)** — Bridging, DHCP, routing on Linux and Windows
-- **[Protocol Specification](docs/design/protocol.md)** — Wire format details
-- **[Architecture](docs/design/architecture.md)** — System design and crate structure
-- **[Performance Results](docs/performance/RESULTS.md)** — Benchmark data
+- **[Installation Guide](docs/guides/INSTALL.md)** -- Binary install, compile from source, systemd setup
+- **[MikroTik Setup Guide](docs/guides/MIKROTIK.md)** -- Configure MikroTik side for interop
+- **[CLI Guide](docs/guides/CLI.md)** -- Full CLI command reference
+- **[PMTUD & Auto-MTU](docs/guides/PMTUD.md)** -- Path MTU discovery, auto-detection, TCP MSS clamping
+- **[IPsec Encryption](docs/guides/IPSEC.md)** -- Optional MikroTik-compatible IPsec via strongSwan
+- **[Networking Guide](docs/guides/NETWORKING.md)** -- Bridging, DHCP, routing on Linux and Windows
+- **[Protocol Specification](docs/design/protocol.md)** -- Wire format details
+- **[Architecture](docs/design/architecture.md)** -- System design and crate structure
+- **[Performance Results](docs/performance/RESULTS.md)** -- Benchmark data
 
 ## Windows (Preview)
 

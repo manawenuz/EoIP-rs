@@ -9,6 +9,10 @@ use std::net::IpAddr;
 /// EoIP encapsulation overhead: 20 (IP) + 8 (GRE/EoIP) + 14 (inner Ethernet).
 pub const EOIP_OVERHEAD: u16 = 42;
 
+/// IPsec ESP overhead for AES-256-CBC + SHA1:
+/// 8 (ESP header) + 16 (AES-CBC IV) + 2 (pad length + next header) + 12 (SHA1 auth tag) = 38.
+pub const IPSEC_ESP_OVERHEAD: u16 = 38;
+
 /// Minimum sane overlay MTU (matches IPv4 minimum 576 - 42).
 pub const MIN_OVERLAY_MTU: u16 = 534;
 

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub enum Command {
     Print { detail: bool, filter: Option<Filter> },
-    Add { tunnel_id: u32, remote: String, local: Option<String>, name: Option<String>, mtu: Option<u32> },
+    Add { tunnel_id: u32, remote: String, local: Option<String>, name: Option<String>, mtu: Option<u32>, ipsec_secret: Option<String> },
     Remove { tunnel_id: u32 },
     Enable { tunnel_id: u32 },
     Disable { tunnel_id: u32 },
@@ -184,8 +184,9 @@ fn parse_add(rest: &[String]) -> Result<Command, String> {
     let local = kv.get("local-address").or(kv.get("local")).cloned();
     let name = kv.get("name").cloned();
     let mtu = kv.get("mtu").map(|v| v.parse::<u32>()).transpose().map_err(|_| "invalid mtu")?;
+    let ipsec_secret = kv.get("ipsec-secret").cloned();
 
-    Ok(Command::Add { tunnel_id, remote, local, name, mtu })
+    Ok(Command::Add { tunnel_id, remote, local, name, mtu, ipsec_secret })
 }
 
 fn parse_remove(rest: &[String]) -> Result<Command, String> {

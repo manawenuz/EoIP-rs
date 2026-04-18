@@ -16,9 +16,13 @@ overlay_mtu = path_mtu - 20 (IP header) - 8 (GRE/EoIP header) - 14 (inner Ethern
 | Path | Path MTU | Overlay MTU |
 |------|----------|-------------|
 | Direct Ethernet | 1500 | 1458 |
+| Direct Ethernet + IPsec | 1500 | 1420 |
 | WireGuard | 1420 | 1378 |
+| WireGuard + IPsec | 1420 | 1340 |
 | PPPoE | 1492 | 1450 |
 | PPPoE + WireGuard | 1412 | 1370 |
+
+> **IPsec note:** When `ipsec_secret` is configured, ESP encryption adds 38 bytes of overhead (8 ESP header + 16 AES-CBC IV + 2 padding + 12 SHA1 auth tag). EoIP-rs subtracts this automatically from the overlay MTU.
 
 ### Detection Stages
 

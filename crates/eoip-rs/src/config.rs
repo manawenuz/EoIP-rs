@@ -20,12 +20,33 @@ pub enum MtuConfig {
 impl MtuConfig {
     /// Resolve to a concrete overlay MTU value.
     ///
-    /// For `Auto`, detects the outgoing interface MTU and subtracts EoIP overhead.
+    /// For `Auto`, detects the outgoing interface MTU and subtracts EoIP overhead
+    /// (and IPsec ESP overhead if `ipsec` is true).
     /// For `Fixed`, returns the configured value directly.
     pub fn resolve(&self, remote: IpAddr) -> u16 {
+        self.resolve_with_ipsec(remote, false)
+    }
+
+    /// Resolve with optional IPsec ESP overhead subtraction.
+    pub fn resolve_with_ipsec(&self, remote: IpAddr, ipsec: bool) -> u16 {
         match self {
-            MtuConfig::Auto => crate::net::mtu::auto_overlay_mtu(remote),
-            MtuConfig::Fixed(v) => *v,
+            MtuConfig::Auto => {
+                let mtu = crate::net::mtu::auto_overlay_mtu(remote);
+                if ipsec {
+                    mtu.saturating_sub(crate::net::mtu::IPSEC_ESP_OVERHEAD)
+                        .max(crate::net::mtu::MIN_OVERLAY_MTU)
+                } else {
+                    mtu
+                }
+            }
+            MtuConfig::Fixed(v) => {
+                if ipsec {
+                    v.saturating_sub(crate::net::mtu::IPSEC_ESP_OVERHEAD)
+                        .max(crate::net::mtu::MIN_OVERLAY_MTU)
+                } else {
+                    *v
+                }
+            }
         }
     }
 
@@ -213,6 +234,10 @@ pub struct TunnelConfig {
     pub keepalive_timeout_secs: u64,
     #[serde(default = "default_clamp_tcp_mss")]
     pub clamp_tcp_mss: bool,
+    /// Optional IPsec pre-shared key. When set, the daemon creates an IKEv1
+    /// transport-mode SA via strongSwan's VICI protocol to encrypt GRE traffic.
+    #[serde(default)]
+    pub ipsec_secret: Option<String>,
 }
 
 impl TunnelConfig {

@@ -17,6 +17,7 @@ use eoip_proto::wire::{DaemonMsg, HelperMsg};
 use eoip_proto::DemuxKey;
 
 use crate::config::TunnelConfig;
+use crate::ipsec::IpsecManager;
 use crate::keepalive;
 use crate::net::tap::TapDevice;
 use crate::packet::buffer::BufferPool;
@@ -41,6 +42,7 @@ pub struct TunnelManager {
     raw_v6_fd: RawFd,
     shutdown: CancellationToken,
     tasks: Mutex<HashMap<u16, TunnelTasks>>,
+    ipsec: Arc<IpsecManager>,
 }
 
 impl TunnelManager {
@@ -52,6 +54,7 @@ impl TunnelManager {
         raw_v4_fd: RawFd,
         raw_v6_fd: RawFd,
         shutdown: CancellationToken,
+        ipsec: Arc<IpsecManager>,
     ) -> Self {
         Self {
             helper: Mutex::new(helper),
@@ -62,7 +65,12 @@ impl TunnelManager {
             raw_v6_fd,
             shutdown,
             tasks: Mutex::new(HashMap::new()),
+            ipsec,
         }
+    }
+
+    pub fn ipsec(&self) -> &Arc<IpsecManager> {
+        &self.ipsec
     }
 
     pub fn registry(&self) -> &Arc<TunnelRegistry> {
@@ -72,7 +80,9 @@ impl TunnelManager {
     /// Create a tunnel dynamically: request TAP from helper, spawn tasks, register.
     pub async fn create_tunnel(&self, config: TunnelConfig) -> Result<(), String> {
         // Resolve MTU: auto-detect or use explicit config value.
-        let resolved_mtu = config.mtu.resolve(config.remote);
+        // Subtract IPsec ESP overhead if ipsec_secret is configured.
+        let has_ipsec = config.ipsec_secret.is_some();
+        let resolved_mtu = config.mtu.resolve_with_ipsec(config.remote, has_ipsec);
         if config.mtu.is_auto() {
             tracing::info!(
                 tunnel_id = config.tunnel_id,
@@ -240,12 +250,25 @@ impl TunnelManager {
             _tap: tap,
         });
 
+        // Set up IPsec if configured
+        if let Some(ref secret) = config.ipsec_secret {
+            match self.ipsec.setup_tunnel(tunnel_id, config.local, config.remote, secret) {
+                Ok(()) => tracing::info!(tunnel_id, "IPsec SA established"),
+                Err(e) => tracing::warn!(tunnel_id, %e, "IPsec setup failed — tunnel runs unencrypted"),
+            }
+        }
+
         tracing::info!(tunnel_id, iface = %iface_name, "tunnel created dynamically");
         Ok(())
     }
 
-    /// Destroy a tunnel: cancel tasks, remove from registry.
+    /// Destroy a tunnel: cancel tasks, tear down IPsec, remove from registry.
     pub fn destroy_tunnel(&self, tunnel_id: u16) -> Result<(), String> {
+        // Tear down IPsec SA if configured
+        if let Err(e) = self.ipsec.teardown_tunnel(tunnel_id) {
+            tracing::warn!(tunnel_id, %e, "IPsec teardown failed");
+        }
+
         // Cancel per-tunnel tasks
         if let Some(tasks) = self.tasks.lock().unwrap().remove(&tunnel_id) {
             tasks.cancel.cancel();

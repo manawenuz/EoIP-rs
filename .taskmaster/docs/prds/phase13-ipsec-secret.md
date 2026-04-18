@@ -1,6 +1,6 @@
 # Phase 13: IPsec Secret (MikroTik EoIP Encryption)
 
-**Status:** Planned (research complete)
+**Status:** Complete (2026-04-18)
 **Priority:** Medium — needed for 100% MikroTik compatibility
 **Dependencies:** Phase 12 (PMTUD) — for MTU adjustment with ESP overhead
 
@@ -257,3 +257,38 @@ Test matrix:
 1. EoIP-rs (Linux) ↔ MikroTik CHR — primary interop test
 2. MikroTik CHR ↔ MikroTik CHR — baseline reference (already verified)
 3. EoIP-rs ↔ EoIP-rs — Linux-to-Linux IPsec (stretch goal)
+
+---
+
+## Implementation Results
+
+**Completed:** 2026-04-18
+
+### Approach
+
+Used strongSwan's VICI control protocol via the `rustici` Rust crate. EoIP-rs connects to strongSwan's VICI socket to programmatically load IKE connections, shared secrets, and initiate SAs. IKEv1 main mode with AES-256-CBC/SHA1 ESP transport mode, matching MikroTik's auto-created IPsec parameters exactly.
+
+### Performance
+
+- Encrypted throughput: ~230 Mbps (EoIP-rs ↔ MikroTik CHR, Hetzner CX23)
+- SA rekeying (Phase 2 every 30min) operates without packet loss
+
+### Key Finding
+
+AF_PACKET (PACKET_MMAP) RX path is skipped when IPsec is active. The kernel's XFRM/IPsec stack decrypts ESP packets and delivers the inner GRE protocol via the raw socket path, bypassing the AF_PACKET ring buffer. This is handled automatically — no special configuration needed.
+
+### Files Created/Modified
+
+| File | Change |
+|------|--------|
+| `crates/eoip-rs/src/ipsec/mod.rs` | NEW — IpsecManager lifecycle |
+| `crates/eoip-rs/src/ipsec/vici.rs` | NEW — VICI client wrapper |
+| `crates/eoip-rs/src/ipsec/config.rs` | NEW — VICI config builder (IKEv1 params) |
+| `crates/eoip-rs/src/ipsec/monitor.rs` | NEW — SA health monitor (30s poll) |
+| `crates/eoip-rs/src/config.rs` | Added `ipsec_secret` field |
+| `crates/eoip-rs/src/tunnel/manager.rs` | IPsec lifecycle hooks |
+| `crates/eoip-rs/src/net/mtu.rs` | ESP overhead constant (38 bytes) |
+| `crates/eoip-api/proto/eoip.proto` | Added ipsec_secret, ipsec_active fields |
+| `crates/eoip-cli/src/parse.rs` | Parse `ipsec-secret=X` |
+| `docs/guides/IPSEC.md` | NEW — setup guide |
+| `scripts/setup-strongswan.sh` | NEW — optional installer |

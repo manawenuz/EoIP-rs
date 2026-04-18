@@ -68,9 +68,9 @@ pub fn start_rx_pipeline(
                         // If mmap returned (error or shutdown), we're done
                         return;
                     }
-                    // Non-linux fallback: AF_PACKET recvmmsg
+                    // AF_PACKET is Linux-only; non-linux should never reach here
                     #[cfg(not(target_os = "linux"))]
-                    rx_loop_v4_afpacket(raw_fd, &registry, &pool, &shutdown);
+                    unreachable!("AF_PACKET not available on non-Linux");
                 })
                 .expect("failed to spawn RX AF_PACKET thread"),
         ]
@@ -477,9 +477,8 @@ fn rx_loop_v4_mmap(
 
 /// EoIPv6 (IPv6, protocol 97) receive loop.
 ///
-/// Uses `recvfrom()` instead of `read()` to obtain the source IPv6 address,
-/// which the kernel provides via the sockaddr (IPv6 raw sockets strip the
-/// IP header from the payload).
+/// Uses `recvmmsg()` for batched receive with per-message sockaddr to obtain
+/// the source IPv6 address (IPv6 raw sockets strip the IP header from payload).
 fn rx_loop_v6(
     raw_fd: std::os::fd::RawFd,
     registry: &TunnelRegistry,
@@ -487,6 +486,179 @@ fn rx_loop_v6(
     shutdown: &CancellationToken,
 ) {
     tracing::info!("RX v6 worker started");
+
+    #[cfg(target_os = "linux")]
+    if try_rx_loop_v6_recvmmsg(raw_fd, registry, pool, shutdown) {
+        return;
+    }
+
+    // Fallback: single recvfrom
+    rx_loop_v6_recvfrom(raw_fd, registry, pool, shutdown);
+}
+
+/// Process a single received IPv6/EtherIP packet.
+#[inline]
+fn process_v6_packet(
+    buf: &[u8],
+    n: usize,
+    src_ip: IpAddr,
+    registry: &TunnelRegistry,
+    pool: &BufferPool,
+) {
+    if n < 2 {
+        return;
+    }
+
+    let (tunnel_id, hdr_len) = match etherip::decode_eoipv6_header(&buf[..n]) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let key = DemuxKey {
+        tunnel_id,
+        peer_addr: src_ip,
+    };
+
+    let guard = match registry.get_ref(&key) {
+        Some(g) => g,
+        None => {
+            log_demux_miss(&key);
+            return;
+        }
+    };
+    let handle = guard.value();
+
+    let frame_data = &buf[hdr_len..n];
+
+    handle.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
+    handle.stats.rx_bytes.fetch_add(frame_data.len() as u64, Ordering::Relaxed);
+    handle.stats.last_rx_timestamp.store(coarse_timestamp_ms(), Ordering::Relaxed);
+
+    if frame_data.is_empty() {
+        return;
+    }
+
+    if let Some(ref tx) = handle.rx_channel {
+        let mut pbuf = pool.get();
+        let payload = pbuf.payload_mut();
+        let copy_len = frame_data.len().min(MAX_FRAME_SIZE);
+        payload[..copy_len].copy_from_slice(&frame_data[..copy_len]);
+        pbuf.set_len(copy_len);
+
+        if tx.try_send(pbuf).is_err() {
+            handle.stats.rx_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Batched IPv6 RX using recvmmsg. Returns true if it ran.
+#[cfg(target_os = "linux")]
+fn try_rx_loop_v6_recvmmsg(
+    raw_fd: std::os::fd::RawFd,
+    registry: &TunnelRegistry,
+    pool: &BufferPool,
+    shutdown: &CancellationToken,
+) -> bool {
+    let mut bufs: Vec<Vec<u8>> = (0..RECV_BATCH).map(|_| vec![0u8; RECV_BUF_SIZE]).collect();
+    let mut iovs: Vec<libc::iovec> = bufs
+        .iter_mut()
+        .map(|buf| libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut _,
+            iov_len: buf.len(),
+        })
+        .collect();
+
+    // Per-message sockaddr for source IPv6 extraction
+    let mut addrs: Vec<libc::sockaddr_in6> =
+        (0..RECV_BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
+
+    let mut msg_hdrs: Vec<libc::mmsghdr> = iovs
+        .iter_mut()
+        .zip(addrs.iter_mut())
+        .map(|(iov, addr)| {
+            let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            hdr.msg_hdr.msg_iov = iov as *mut _;
+            hdr.msg_hdr.msg_iovlen = 1;
+            hdr.msg_hdr.msg_name = addr as *mut _ as *mut libc::c_void;
+            hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+            hdr
+        })
+        .collect();
+
+    // Test recvmmsg availability
+    let timeout = libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+    let ret = unsafe {
+        libc::recvmmsg(
+            raw_fd,
+            msg_hdrs.as_mut_ptr(),
+            1,
+            libc::MSG_DONTWAIT,
+            &timeout as *const _ as *mut _,
+        )
+    };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOSYS) {
+            tracing::warn!("recvmmsg not supported for v6, falling back to recvfrom");
+            return false;
+        }
+    }
+
+    tracing::info!("RX v6 using recvmmsg (batch={})", RECV_BATCH);
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        // Reset msg_namelen for each header (kernel may modify it)
+        for hdr in msg_hdrs.iter_mut() {
+            hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+        }
+
+        let timeout = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+        let count = unsafe {
+            libc::recvmmsg(
+                raw_fd,
+                msg_hdrs.as_mut_ptr(),
+                RECV_BATCH as u32,
+                libc::MSG_WAITFORONE,
+                &timeout as *const _ as *mut _,
+            )
+        };
+
+        if count < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted
+                || err.kind() == std::io::ErrorKind::WouldBlock
+            {
+                continue;
+            }
+            if !shutdown.is_cancelled() {
+                tracing::error!(%err, "RX v6 recvmmsg error");
+            }
+            break;
+        }
+
+        for i in 0..count as usize {
+            let n = msg_hdrs[i].msg_len as usize;
+            let src_ip = IpAddr::V6(Ipv6Addr::from(addrs[i].sin6_addr.s6_addr));
+            process_v6_packet(&bufs[i], n, src_ip, registry, pool);
+        }
+    }
+
+    tracing::info!("RX v6 worker stopped");
+    true
+}
+
+/// Single-packet IPv6 RX fallback using recvfrom.
+fn rx_loop_v6_recvfrom(
+    raw_fd: std::os::fd::RawFd,
+    registry: &TunnelRegistry,
+    pool: &BufferPool,
+    shutdown: &CancellationToken,
+) {
+    tracing::info!("RX v6 using recvfrom (single-packet fallback)");
     let mut recv_buf = vec![0u8; RECV_BUF_SIZE];
     let mut sockaddr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
 
@@ -520,54 +692,8 @@ fn rx_loop_v6(
             }
         }
 
-        let n = n as usize;
-        if n < 2 {
-            continue;
-        }
-
         let src_ip = IpAddr::V6(Ipv6Addr::from(sockaddr.sin6_addr.s6_addr));
-
-        let (tunnel_id, hdr_len) = match etherip::decode_eoipv6_header(&recv_buf[..n]) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let key = DemuxKey {
-            tunnel_id,
-            peer_addr: src_ip,
-        };
-
-        let guard = match registry.get_ref(&key) {
-            Some(g) => g,
-            None => {
-                log_demux_miss(&key);
-                continue;
-            }
-        };
-        let handle = guard.value();
-
-        let frame_data = &recv_buf[hdr_len..n];
-        let is_keepalive = frame_data.is_empty();
-
-        handle.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
-        handle.stats.rx_bytes.fetch_add(frame_data.len() as u64, Ordering::Relaxed);
-        handle.stats.last_rx_timestamp.store(coarse_timestamp_ms(), Ordering::Relaxed);
-
-        if is_keepalive {
-            continue;
-        }
-
-        if let Some(ref tx) = handle.rx_channel {
-            let mut buf = pool.get();
-            let payload = buf.payload_mut();
-            let copy_len = frame_data.len().min(MAX_FRAME_SIZE);
-            payload[..copy_len].copy_from_slice(&frame_data[..copy_len]);
-            buf.set_len(copy_len);
-
-            if tx.try_send(buf).is_err() {
-                handle.stats.rx_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        process_v6_packet(&recv_buf, n as usize, src_ip, registry, pool);
     }
 
     tracing::info!("RX v6 worker stopped");

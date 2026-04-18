@@ -60,6 +60,8 @@ eoip-cli print where name=eoip-dc1       # Filter by name
 
 **Flags:** `R` = running, `X` = disabled, `S` = stale, `I` = initializing
 
+`print detail` also shows IPsec status when configured: `ipsec=yes ipsec-active=yes/no`.
+
 ### add
 
 Create a new tunnel dynamically (no daemon restart needed).
@@ -67,6 +69,7 @@ Create a new tunnel dynamically (no daemon restart needed).
 ```bash
 eoip-cli add tunnel-id=200 remote-address=10.0.0.2 local-address=10.0.0.1
 eoip-cli add tunnel-id=300 remote-address=10.0.0.3 local-address=10.0.0.1 name=eoip-dc2 mtu=1400
+eoip-cli add tunnel-id=400 remote-address=10.0.0.4 local-address=10.0.0.1 ipsec-secret=SecretPass
 ```
 
 After adding, configure the TAP interface:
