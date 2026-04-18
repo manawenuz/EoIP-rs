@@ -129,14 +129,21 @@ pub fn create_af_packet_socket_v4() -> Result<OwnedFd, EoipError> {
         tracing::warn!("PACKET_IGNORE_OUTGOING not available, outgoing packets may flood ring");
     }
 
-    // BPF filter: accept GRE (proto 47) only.
+    // BPF filter: accept GRE (proto 47) and IP fragments of GRE packets.
     // With SOCK_RAW on AF_PACKET, BPF sees full L2 frame.
     // Offset 23 = 14 (ETH) + 9 (IP protocol field).
+    // Offset 20 = 14 (ETH) + 6 (IP frag offset field, 2 bytes).
+    //
+    // GRE-encapsulated 1500-byte frames exceed MTU → IP fragmentation.
+    // Only the first fragment has the GRE header; subsequent fragments
+    // have fragment offset > 0 and no GRE header. Must accept both.
     //
     //   0: LDB  [23]             ; load IP protocol byte
-    //   1: JEQ  #47, 0, 1        ; if GRE → accept, else → drop
-    //   2: RET  #0xFFFF          ; accept (return max snaplen)
-    //   3: RET  #0               ; drop
+    //   1: JEQ  #47, 4, 0        ; if GRE → accept
+    //   2: LDH  [20]             ; load IP flags+frag_offset (2 bytes)
+    //   3: JSET #0x1FFF, 0, 1    ; if frag_offset != 0 → accept (continuation fragment)
+    //   4: RET  #0               ; drop (not GRE, not a fragment)
+    //   5: RET  #0xFFFF          ; accept
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct SockFilter {
@@ -146,11 +153,13 @@ pub fn create_af_packet_socket_v4() -> Result<OwnedFd, EoipError> {
         k: u32,
     }
 
-    let filter: [SockFilter; 4] = [
-        SockFilter { code: 0x30, jt: 0, jf: 0, k: 23 },      // LDB [23]
-        SockFilter { code: 0x15, jt: 0, jf: 1, k: 47 },      // JEQ #47
-        SockFilter { code: 0x06, jt: 0, jf: 0, k: 0xFFFF },  // RET accept
-        SockFilter { code: 0x06, jt: 0, jf: 0, k: 0 },       // RET drop
+    let filter: [SockFilter; 6] = [
+        SockFilter { code: 0x30, jt: 0, jf: 0, k: 23 },        // LDB [23]
+        SockFilter { code: 0x15, jt: 3, jf: 0, k: 47 },        // JEQ #47 → accept (skip 3)
+        SockFilter { code: 0x28, jt: 0, jf: 0, k: 20 },        // LDH [20] (flags+frag_offset)
+        SockFilter { code: 0x45, jt: 1, jf: 0, k: 0x1FFF },    // JSET #0x1FFF → accept (frag)
+        SockFilter { code: 0x06, jt: 0, jf: 0, k: 0 },         // RET drop
+        SockFilter { code: 0x06, jt: 0, jf: 0, k: 0xFFFF },    // RET accept
     ];
 
     #[repr(C)]

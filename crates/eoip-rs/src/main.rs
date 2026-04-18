@@ -190,6 +190,7 @@ async fn run(args: Args) -> Result<(), DaemonError> {
     let _rx_handle = rx::start_rx_pipeline(
         raw_v4_fd.as_ref().map(|fd| fd.as_fd()),
         raw_v6_fd.as_ref().map(|fd| fd.as_fd()),
+        af_packet_fd.as_ref().map(|fd| fd.as_fd()),
         Arc::clone(&registry),
         Arc::clone(&pool),
         shutdown.token().clone(),
