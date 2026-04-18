@@ -238,8 +238,8 @@ async fn run(args: Args) -> Result<(), DaemonError> {
         tracing::info!(tunnel_id, "tunnel tasks started");
     }
 
-    // TX batcher (shared by all tunnels)
-    tx::spawn_tx_batcher(raw_v4_raw, tx_receiver, &config.performance, shutdown.token().clone());
+    // TX batcher (shared by all tunnels, routes packets to correct raw socket)
+    tx::spawn_tx_batcher(raw_v4_raw, raw_v6_raw, tx_receiver, &config.performance, shutdown.token().clone());
     tracing::info!("TX batcher started");
 
     // Start gRPC API (with TunnelManager for dynamic creation)

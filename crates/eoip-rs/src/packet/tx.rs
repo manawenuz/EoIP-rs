@@ -109,12 +109,14 @@ async fn read_and_encode(
     Ok(TxPacket { buf, dest })
 }
 
-/// Spawn a TX batcher task for a raw socket.
+/// Spawn a TX batcher task for raw sockets.
 ///
-/// Receives `TxPacket`s from all TAP readers of one protocol family,
-/// batches them adaptively, and flushes via the raw socket.
+/// Receives `TxPacket`s from all TAP readers, batches them adaptively,
+/// and flushes via the appropriate raw socket (v4 or v6) based on
+/// destination address.
 pub fn spawn_tx_batcher(
-    raw_fd: std::os::fd::RawFd,
+    raw_v4_fd: std::os::fd::RawFd,
+    raw_v6_fd: std::os::fd::RawFd,
     mut rx: mpsc::Receiver<TxPacket>,
     config: &crate::config::PerformanceConfig,
     shutdown: CancellationToken,
@@ -142,7 +144,7 @@ pub fn spawn_tx_batcher(
             // If queue has more packets, try to fill the batch
             if batch.len() < low_water {
                 // Immediate mode: send now for low latency
-                flush_batch(raw_fd, &mut batch);
+                flush_batch(raw_v4_fd, raw_v6_fd, &mut batch);
                 continue;
             }
 
@@ -161,33 +163,52 @@ pub fn spawn_tx_batcher(
                 }
             }
 
-            flush_batch(raw_fd, &mut batch);
+            flush_batch(raw_v4_fd, raw_v6_fd, &mut batch);
         }
 
         // Flush remaining
         if !batch.is_empty() {
-            flush_batch(raw_fd, &mut batch);
+            flush_batch(raw_v4_fd, raw_v6_fd, &mut batch);
         }
 
         tracing::info!("TX batcher stopped");
     })
 }
 
-fn flush_batch(raw_fd: std::os::fd::RawFd, batch: &mut Vec<TxPacket>) {
+fn flush_batch(raw_v4_fd: std::os::fd::RawFd, raw_v6_fd: std::os::fd::RawFd, batch: &mut Vec<TxPacket>) {
     if batch.is_empty() {
         return;
     }
 
-    let len = batch.len();
+    // Split batch by protocol — sendmmsg requires all messages on the same fd
+    let mut v4_pkts: Vec<&TxPacket> = Vec::new();
+    let mut v6_pkts: Vec<&TxPacket> = Vec::new();
+    for pkt in batch.iter() {
+        match pkt.dest {
+            SocketAddr::V4(_) => v4_pkts.push(pkt),
+            SocketAddr::V6(_) => v6_pkts.push(pkt),
+        }
+    }
 
-    // Build iovec and sockaddr arrays — must outlive mmsghdr
+    if !v4_pkts.is_empty() {
+        send_batch(raw_v4_fd, &v4_pkts);
+    }
+    if !v6_pkts.is_empty() {
+        send_batch(raw_v6_fd, &v6_pkts);
+    }
+
+    batch.clear();
+}
+
+fn send_batch(raw_fd: std::os::fd::RawFd, pkts: &[&TxPacket]) {
+    let len = pkts.len();
+
     let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(len);
     let mut addrs_v4: Vec<libc::sockaddr_in> = Vec::new();
     let mut addrs_v6: Vec<libc::sockaddr_in6> = Vec::new();
-    // Track which addr type each message uses: false=v4, true=v6
     let mut is_v6: Vec<bool> = Vec::with_capacity(len);
 
-    for pkt in batch.iter() {
+    for pkt in pkts {
         let data = pkt.buf.as_slice();
         iovecs.push(libc::iovec {
             iov_base: data.as_ptr() as *mut libc::c_void,
@@ -211,7 +232,6 @@ fn flush_batch(raw_fd: std::os::fd::RawFd, batch: &mut Vec<TxPacket>) {
         }
     }
 
-    // Build mmsghdr array pointing into the stable vecs
     let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(len);
     let mut v4_idx = 0usize;
     let mut v6_idx = 0usize;
@@ -231,7 +251,6 @@ fn flush_batch(raw_fd: std::os::fd::RawFd, batch: &mut Vec<TxPacket>) {
         msgs.push(hdr);
     }
 
-    // Single syscall for the entire batch
     let sent = unsafe {
         libc::sendmmsg(raw_fd, msgs.as_mut_ptr(), msgs.len() as u32, 0)
     };
@@ -243,8 +262,6 @@ fn flush_batch(raw_fd: std::os::fd::RawFd, batch: &mut Vec<TxPacket>) {
             _ => tracing::error!(%err, "TX sendmmsg failed"),
         }
     }
-
-    batch.clear();
 }
 
 /// Send a keepalive (zero-payload) packet for a tunnel.

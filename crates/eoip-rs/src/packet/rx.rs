@@ -313,6 +313,10 @@ fn try_rx_loop_recvmmsg(
 }
 
 /// EoIPv6 (IPv6, protocol 97) receive loop.
+///
+/// Uses `recvfrom()` instead of `read()` to obtain the source IPv6 address,
+/// which the kernel provides via the sockaddr (IPv6 raw sockets strip the
+/// IP header from the payload).
 fn rx_loop_v6(
     raw_fd: std::os::fd::RawFd,
     registry: &TunnelRegistry,
@@ -321,26 +325,44 @@ fn rx_loop_v6(
 ) {
     tracing::info!("RX v6 worker started");
     let mut recv_buf = vec![0u8; 65536];
+    let mut sockaddr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
 
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        let n = match nix::unistd::read(raw_fd, &mut recv_buf) {
-            Ok(n) => n,
-            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
-            Err(e) => {
-                if !shutdown.is_cancelled() {
-                    tracing::error!(%e, "RX v6 read error");
-                }
-                break;
-            }
+        let mut addr_len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        let n = unsafe {
+            libc::recvfrom(
+                raw_fd,
+                recv_buf.as_mut_ptr() as *mut libc::c_void,
+                recv_buf.len(),
+                0,
+                &mut sockaddr as *mut _ as *mut libc::sockaddr,
+                &mut addr_len,
+            )
         };
 
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
+                _ => {
+                    if !shutdown.is_cancelled() {
+                        tracing::error!(%err, "RX v6 recvfrom error");
+                    }
+                    break;
+                }
+            }
+        }
+
+        let n = n as usize;
         if n < 2 {
             continue;
         }
+
+        let src_ip = IpAddr::V6(Ipv6Addr::from(sockaddr.sin6_addr.s6_addr));
 
         let (tunnel_id, hdr_len) = match etherip::decode_eoipv6_header(&recv_buf[..n]) {
             Ok(v) => v,
@@ -349,7 +371,7 @@ fn rx_loop_v6(
 
         let key = DemuxKey {
             tunnel_id,
-            peer_addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            peer_addr: src_ip,
         };
 
         let handle = match registry.get(&key) {
