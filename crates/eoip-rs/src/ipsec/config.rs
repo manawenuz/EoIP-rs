@@ -52,16 +52,13 @@ impl IpsecTunnelConfig {
             .section_start(&conn)
                 // IKEv1 main mode
                 .kv_str("version", "1")
-                // Local endpoint
-                .section_start("local")
-                    .kv_str("auth", "psk")
-                    .kv_str("id", &local)
-                .section_end()
-                // Remote endpoint
-                .section_start("remote")
-                    .kv_str("auth", "psk")
-                    .kv_str("id", &remote)
-                .section_end()
+                // Local/remote addresses (MUST be lists for VICI)
+                .list_start("local_addrs")
+                    .list_item_str(&local)
+                .list_end()
+                .list_start("remote_addrs")
+                    .list_item_str(&remote)
+                .list_end()
                 // IKE proposals matching MikroTik Phase 1 offers
                 .list_start("proposals")
                     .list_item_str("aes128-sha1-modp2048")
@@ -73,9 +70,16 @@ impl IpsecTunnelConfig {
                 .kv_str("dpd_delay", "8s")
                 // IKE SA lifetime (Phase 1): 24 hours
                 .kv_str("rekey_time", "24h")
-                // Local/remote addresses
-                .kv_str("local_addrs", &local)
-                .kv_str("remote_addrs", &remote)
+                // Local auth (section name local-1 for strongSwan VICI)
+                .section_start("local-1")
+                    .kv_str("auth", "psk")
+                    .kv_str("id", &local)
+                .section_end()
+                // Remote auth
+                .section_start("remote-1")
+                    .kv_str("auth", "psk")
+                    .kv_str("id", &remote)
+                .section_end()
                 // Child SA (ESP)
                 .section_start("children")
                     .section_start(&child)

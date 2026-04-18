@@ -89,6 +89,9 @@ async fn run(args: Args) -> Result<(), DaemonError> {
     let pool = Arc::new(BufferPool::new(pool_size));
     let (tx_sender, tx_receiver) = mpsc::channel::<TxPacket>(config.performance.channel_buffer);
 
+    // Check if any tunnel needs IPsec (used to skip AF_PACKET and start IpsecManager)
+    let has_ipsec_tunnels = config.tunnels.iter().any(|t| t.ipsec_secret.is_some());
+
     // Create initial tunnels from config (gets raw sockets from first tunnel)
     let mut startup_tunnels: Vec<(u16, Arc<TapDevice>)> = Vec::new();
 
@@ -188,16 +191,23 @@ async fn run(args: Args) -> Result<(), DaemonError> {
         startup_tunnels.push((tunnel_id, tap));
     }
 
-    // Create AF_PACKET socket for PACKET_MMAP zero-copy RX (directly in daemon)
+    // Create AF_PACKET socket for PACKET_MMAP zero-copy RX (directly in daemon).
+    // Skip AF_PACKET when IPsec is active: AF_PACKET sees pre-XFRM packets (ESP proto 50),
+    // while the raw GRE socket receives post-decryption GRE packets from the kernel.
     #[cfg(target_os = "linux")]
-    let af_packet_fd: Option<OwnedFd> = match eoip_helper::rawsock::create_af_packet_socket_v4() {
-        Ok(fd) => {
-            tracing::info!("AF_PACKET socket created for zero-copy RX");
-            Some(fd)
-        }
-        Err(e) => {
-            tracing::info!(%e, "AF_PACKET not available, using recvmmsg");
-            None
+    let af_packet_fd: Option<OwnedFd> = if has_ipsec_tunnels {
+        tracing::info!("IPsec active — skipping AF_PACKET, using raw socket for post-XFRM RX");
+        None
+    } else {
+        match eoip_helper::rawsock::create_af_packet_socket_v4() {
+            Ok(fd) => {
+                tracing::info!("AF_PACKET socket created for zero-copy RX");
+                Some(fd)
+            }
+            Err(e) => {
+                tracing::info!(%e, "AF_PACKET not available, using recvmmsg");
+                None
+            }
         }
     };
     #[cfg(not(target_os = "linux"))]
@@ -219,13 +229,7 @@ async fn run(args: Args) -> Result<(), DaemonError> {
     let raw_v6_raw = raw_v6_fd.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(-1);
 
     // Create IpsecManager (connects to strongSwan if available)
-    let has_ipsec_tunnels = config.tunnels.iter().any(|t| t.ipsec_secret.is_some());
-    let ipsec = if has_ipsec_tunnels {
-        Arc::new(IpsecManager::new())
-    } else {
-        // No tunnels need IPsec — skip VICI connection attempt
-        Arc::new(IpsecManager::new())
-    };
+    let ipsec = Arc::new(IpsecManager::new());
 
     // Create TunnelManager (holds helper socket for dynamic creation)
     let manager = Arc::new(TunnelManager::new(
