@@ -222,6 +222,7 @@ async fn run(args: Args) -> Result<(), DaemonError> {
         Arc::clone(&pool),
         shutdown.token().clone(),
         config.performance.rx_workers,
+        &config.performance.cpu_affinity,
     );
     tracing::info!("RX pipeline started");
 

@@ -47,6 +47,7 @@ pub fn start_rx_pipeline(
     pool: Arc<BufferPool>,
     shutdown: CancellationToken,
     rx_workers: usize,
+    cpu_affinity: &[usize],
 ) -> RxPipelineHandle {
     let rx_workers = rx_workers.max(1);
 
@@ -57,10 +58,12 @@ pub fn start_rx_pipeline(
         let registry = Arc::clone(&registry);
         let pool = Arc::clone(&pool);
         let shutdown = shutdown.clone();
+        let cpu = cpu_affinity.first().copied();
         vec![
             std::thread::Builder::new()
                 .name("rx-v4-afp".into())
                 .spawn(move || {
+                    pin_thread_to_cpu(cpu);
                     // Try PACKET_MMAP ring first
                     #[cfg(target_os = "linux")]
                     {
@@ -82,9 +85,13 @@ pub fn start_rx_pipeline(
                 let registry = Arc::clone(&registry);
                 let pool = Arc::clone(&pool);
                 let shutdown = shutdown.clone();
+                let cpu = cpu_affinity.get(i).copied();
                 std::thread::Builder::new()
                     .name(format!("rx-v4-{i}"))
-                    .spawn(move || rx_loop_v4(raw_fd, &registry, &pool, &shutdown))
+                    .spawn(move || {
+                        pin_thread_to_cpu(cpu);
+                        rx_loop_v4(raw_fd, &registry, &pool, &shutdown);
+                    })
                     .expect("failed to spawn RX v4 thread")
             })
             .collect()
@@ -97,13 +104,39 @@ pub fn start_rx_pipeline(
         let registry = Arc::clone(&registry);
         let pool = Arc::clone(&pool);
         let shutdown = shutdown.clone();
+        // Use the last affinity entry for v6 if available
+        let cpu = cpu_affinity.last().copied();
         std::thread::Builder::new()
             .name("rx-v6".into())
-            .spawn(move || rx_loop_v6(raw_fd, &registry, &pool, &shutdown))
+            .spawn(move || {
+                pin_thread_to_cpu(cpu);
+                rx_loop_v6(raw_fd, &registry, &pool, &shutdown);
+            })
             .expect("failed to spawn RX v6 thread")
     });
 
     RxPipelineHandle { v4_threads, v6_thread }
+}
+
+/// Pin the current thread to a specific CPU core via sched_setaffinity.
+/// No-op if `cpu` is None or on non-Linux platforms.
+fn pin_thread_to_cpu(cpu: Option<usize>) {
+    #[cfg(target_os = "linux")]
+    if let Some(cpu_id) = cpu {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(cpu_id, &mut set);
+            let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            if ret == 0 {
+                tracing::info!(cpu = cpu_id, "pinned thread to CPU");
+            } else {
+                tracing::warn!(cpu = cpu_id, "failed to pin thread to CPU");
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cpu;
 }
 
 /// Rate-limited demux miss logging.
@@ -475,27 +508,6 @@ fn rx_loop_v4_mmap(
     tracing::info!("RX v4 PACKET_MMAP worker stopped");
 }
 
-/// EoIPv6 (IPv6, protocol 97) receive loop.
-///
-/// Uses `recvmmsg()` for batched receive with per-message sockaddr to obtain
-/// the source IPv6 address (IPv6 raw sockets strip the IP header from payload).
-fn rx_loop_v6(
-    raw_fd: std::os::fd::RawFd,
-    registry: &TunnelRegistry,
-    pool: &BufferPool,
-    shutdown: &CancellationToken,
-) {
-    tracing::info!("RX v6 worker started");
-
-    #[cfg(target_os = "linux")]
-    if try_rx_loop_v6_recvmmsg(raw_fd, registry, pool, shutdown) {
-        return;
-    }
-
-    // Fallback: single recvfrom
-    rx_loop_v6_recvfrom(raw_fd, registry, pool, shutdown);
-}
-
 /// Process a single received IPv6/EtherIP packet.
 #[inline]
 fn process_v6_packet(
@@ -549,6 +561,27 @@ fn process_v6_packet(
             handle.stats.rx_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// EoIPv6 (IPv6, protocol 97) receive loop.
+///
+/// Uses `recvmmsg()` for batched receive with per-message sockaddr to obtain
+/// the source IPv6 address (IPv6 raw sockets strip the IP header from payload).
+fn rx_loop_v6(
+    raw_fd: std::os::fd::RawFd,
+    registry: &TunnelRegistry,
+    pool: &BufferPool,
+    shutdown: &CancellationToken,
+) {
+    tracing::info!("RX v6 worker started");
+
+    #[cfg(target_os = "linux")]
+    if try_rx_loop_v6_recvmmsg(raw_fd, registry, pool, shutdown) {
+        return;
+    }
+
+    // Fallback: single recvfrom
+    rx_loop_v6_recvfrom(raw_fd, registry, pool, shutdown);
 }
 
 /// Batched IPv6 RX using recvmmsg. Returns true if it ran.
