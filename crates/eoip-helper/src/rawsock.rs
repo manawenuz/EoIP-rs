@@ -68,7 +68,8 @@ pub fn create_raw_socket_v6() -> Result<OwnedFd, EoipError> {
         Type::RAW,
         Some(Protocol::from(PROTO_ETHERIP)),
     )?;
-    sock.set_only_v6(true)?;
+    // Note: IPV6_V6ONLY is not valid for raw sockets (EINVAL on Linux).
+    // Raw sockets don't accept IPv4-mapped addresses regardless.
     sock.set_nonblocking(true)?;
 
     // Enlarge socket buffers to absorb bursts between userspace batch drains.
