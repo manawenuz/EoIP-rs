@@ -1,31 +1,56 @@
 # Phase 11: Userspace Performance Optimization
 
-**Status:** Active
+**Status:** Routes 1-3 complete, IPv6 fixed. Remaining: hot-path micro-optimizations + PACKET_MMAP.
 **Priority:** High — squeeze maximum throughput from the userspace data plane before jumping to XDP
 **Dependencies:** Phase 8 (baseline throughput numbers), Phase 10 PRD (context for ceiling)
-**Branch:** `feat/packet-mmap-wip` (WIP, not merged — see Post-Mortem below)
-**Baseline:** v0.1.0-alpha.1 + IPv6 fix (commit `064486b`)
+**Branches:** `feat/phase11-userspace-perf` (merged), `fix/ipv6-transport` (merged), `feat/packet-mmap-wip` (WIP, not merged)
+**Current release:** v0.1.0-alpha.3 (includes all Route 1-3 + IPv6 fixes)
 
 ---
 
 ## Objective
 
-Maximize EoIP-rs userspace RX/TX throughput on commodity Linux VMs (Hetzner CPX22, 2 shared vCPU) before investing in kernel-bypass approaches (XDP/eBPF, io_uring). The current architecture leaves performance on the table with single-`sendto` TX, untuned socket buffers, and per-packet TAP writes.
+Maximize EoIP-rs userspace RX/TX throughput on commodity Linux VMs (Hetzner CPX22, 2 shared vCPU) before investing in kernel-bypass approaches (XDP/eBPF, io_uring).
 
-## Current Baseline
+## Performance History
 
 **Test Environment:** 2x Hetzner CPX22 (2 vCPU, 4 GB RAM, shared x86_64), Ubuntu 22.04, Linux 5.15, Rust 1.95.0.
 
+### Pre-optimization baseline (v0.1.0-alpha.1)
+
 | Metric | Value | Notes |
 |--------|-------|-------|
-| TX throughput (iperf3) | **500 Mbps** | Single stream, node1 → node2 |
-| RX throughput (iperf3) | **424 Mbps** | Single stream, node2 → node1 |
-| TX CPU | 1.3% | Negligible — TX is not the bottleneck |
-| RX CPU | 20.3% | This is where optimization matters |
-| Latency overhead | ~190 us | Acceptable for L2 tunnel |
-| Cross-compat | Full | new+old, old+new all work |
+| TX throughput (iperf3) | **369 Mbps** | 3-round average, Latin square |
+| RX throughput (iperf3) | **279 Mbps** | 3-round average, Latin square |
+| TX CPU | 1.1% | |
+| RX CPU | 20.7% | |
 
-Previous Phase 8 numbers on CX23 were 346 Mbps TX / 135 Mbps RX. The improvement to 500/424 is from recompiling with Rust 1.95 + the `recvmmsg` batching optimization (commit `bce0fb5`). The RX CPU is the primary target.
+### Post-optimization (v0.1.0-alpha.3, Routes 1-3 + IPv6 fix)
+
+| Metric | IPv4 | IPv6 | Notes |
+|--------|------|------|-------|
+| TX throughput | **570 Mbps** (+54%) | **301 Mbps** | 3-round avg |
+| RX throughput | **456 Mbps** (+63%) | **452 Mbps** | 3-round avg |
+| TX CPU | 1.6% | 1.1% | |
+| RX CPU | 24.9% | 31.9% | |
+
+### btest results (MikroTik bandwidth-test protocol)
+
+| Peer | TX | RX | Notes |
+|------|----|----|-------|
+| Hetzner CHR (RouterOS 7.18.2) | 226 Mbps | ~1 Mbps | RX limited by CHR free license |
+| MikroTik hardware (LAN) | 350 Mbps avg | 260 Mbps avg | Via user's MikroTik router |
+| Raspberry Pi 4 (wifi) | — | — | Tunnel works, wifi-limited |
+
+### Cross-compatibility matrix (all pass)
+
+| Config | TX | RX |
+|--------|----|----|
+| alpha.3 + alpha.3 | 570 | 456 |
+| alpha.3 + alpha.1 | 412 | 456 |
+| alpha.1 + alpha.3 | 477 | 270 |
+| MikroTik CHR ↔ alpha.3 | pass | pass |
+| Raspberry Pi 4 ↔ MikroTik | pass | pass (wifi) |
 
 ---
 
@@ -92,109 +117,98 @@ The `feat/packet-mmap-wip` branch contains:
 
 ---
 
-## Optimization Routes
+## Completed Optimization Routes
 
-### Route 1: `sendmmsg` for TX (Low Risk, Medium Impact)
+### Route 1: SO_RCVBUF/SO_SNDBUF Tuning — DONE ✓
 
-**Current state:** TX uses individual `sendto()` calls per packet via `nix::sys::socket::sendto()` in a loop (`flush_batch` in `tx.rs`). Despite the "batch" name, each packet is a separate syscall.
+**Commit:** `da88e9c` | **Impact:** Biggest single win (+22% TX, +10% RX in isolation)
 
-**Proposed:** Replace the `sendto` loop with `sendmmsg()`, matching the RX path's `recvmmsg` batching. This amortizes syscall overhead across the entire batch.
+Set socket buffers to 4 MB on both IPv4 and IPv6 raw sockets (was ~212 KB kernel default). Absorbs burst traffic between userspace batch drains.
 
-```
-Before: N packets → N sendto() syscalls
-After:  N packets → 1 sendmmsg() syscall
-```
+### Route 2: sendmmsg for TX — DONE ✓
 
-**Expected impact:** TX is currently at 1.3% CPU for 500 Mbps. The headroom is large, but `sendmmsg` would reduce syscall overhead and improve throughput ceiling when the link allows more than 500 Mbps (e.g., dedicated VMs, bare metal).
+**Commit:** `238b722` | **Impact:** Fewer syscalls, architectural correctness
 
-**Complexity:** Low. The batch infrastructure already exists. Replace the for loop in `flush_batch()` with `libc::sendmmsg()`.
+Replaced per-packet `sendto()` loop with single `sendmmsg()` call per batch. Also fixed to route v4/v6 packets to correct raw socket (was sending v6 on v4 fd).
 
-### Route 2: `SO_RCVBUF` / `SO_SNDBUF` Tuning (Low Risk, Low-Medium Impact)
+### Route 3: TAP Writer Batch Drain — DONE ✓
 
-**Current state:** Socket buffer sizes use kernel defaults (~212 KB on most systems). Under burst traffic, the kernel drops packets before userspace can drain them.
+**Commit:** `7e06a31` | **Impact:** Reduced channel contention
 
-**Proposed:** Set `SO_RCVBUF` to 4 MB and `SO_SNDBUF` to 4 MB on the raw GRE socket. This matches the design doc's recommendation (`docs/design/performance.md` line 34-35) which was never implemented.
+TAP writer thread now drains up to 32 frames per channel wake-up. Note: `writev()` on TAP doesn't preserve frame boundaries, so each frame is still a separate `write()` syscall — but channel wake-ups are reduced.
 
-```rust
-sock.set_recv_buffer_size(4 * 1024 * 1024)?;
-sock.set_send_buffer_size(4 * 1024 * 1024)?;
-```
+### IPv6 Transport Fix — DONE ✓
 
-**Expected impact:** Reduces packet drops under burst load. Most visible during iperf3 RX where the daemon processes packets in batches — larger socket buffers absorb inter-batch gaps.
+**Commits:** `2a40e52`, `e3d9b6f`, `0402525` | **Impact:** EoIPv6 now works
 
-**Complexity:** Trivial. Two `setsockopt` calls in `rawsock.rs`.
-
-### Route 3: `writev` / `readv` on TAP (Medium Risk, Medium Impact)
-
-**Current state:** TAP reads use single `AsyncFd::read()` calls (one frame per syscall). TAP writes use `libc::write()` in a dedicated thread (one frame per syscall).
-
-**Proposed:** Use `readv()` / `writev()` to batch multiple Ethernet frames per TAP syscall. Linux TAP devices support this when `IFF_MULTI_QUEUE` is set.
-
-**Expected impact:** Reduces per-frame syscall overhead on the TAP side. Currently each received GRE packet triggers one TAP write syscall. Batching 8-32 writes into one `writev()` would reduce context switches proportionally.
-
-**Complexity:** Medium. Requires:
-- Enabling `IFF_MULTI_QUEUE` on TAP creation
-- Accumulating frames before writing (need a mini-batcher or drain the crossbeam channel in batches)
-- Verifying frame boundaries are preserved (each `iovec` entry must be one complete Ethernet frame)
-
-**Risk:** TAP `writev` behavior varies by kernel version. Needs testing.
-
-### Route 4: AF_PACKET + PACKET_MMAP (High Risk, High Impact)
-
-**Current state:** Failed attempt on `feat/packet-mmap-wip`. See Post-Mortem above.
-
-**Proposed:** Revisit with the lessons learned. Specifically:
-1. Use `SOCK_RAW` (not `SOCK_DGRAM`)
-2. Use `PACKET_IGNORE_OUTGOING` (not BPF pkttype extension)
-3. Use simple GRE-only BPF filter at offset 23
-4. Create socket directly in daemon (not via helper)
-5. **Validate under sustained iperf3 load before considering it done**
-
-The ring buffer itself (`packet_mmap.rs`) is structurally sound. The bugs were all in socket setup and filtering, not in the ring processing logic. However, the ring's behavior under sustained load was never successfully validated.
-
-**Expected impact:** Eliminates one memcpy per RX packet (kernel → recv buffer). Reduces syscall count to near-zero (poll only when ring is empty). Theoretical 2x RX throughput improvement.
-
-**Complexity:** High. Four bugs encountered in first attempt. The TPACKET_V3 API has poor documentation and many kernel-version-specific behaviors.
-
-**Prerequisite:** Validate `PACKET_IGNORE_OUTGOING` + simple BPF + SOCK_RAW + TPACKET_V3 in a standalone test program before integrating.
-
-### Route 5: Needs Research
-
-The following optimizations require further investigation before a concrete plan can be formed:
-
-| Optimization | Description | Research Needed |
-|-------------|-------------|-----------------|
-| **io_uring** | Replace `recvmmsg`/`sendmmsg` with io_uring SQE batches. Zero syscall overhead. | Requires kernel >= 5.19 for multi-shot recv. Need to validate with raw sockets and TAP devices. |
-| **GRO/GSO on TAP** | Generic Receive/Segmentation Offload on the TAP device. Kernel aggregates small packets into large ones before delivery. | `ethtool -K tap0 gro on` — does this work with EoIP's GRE encap? Need to test. |
-| **XDP redirect** | Full kernel data plane (Phase 10 PRD). Bypasses all userspace for data packets. | Already has a PRD. Significant complexity. Requires eBPF C code, map management, fallback path. |
-| **CPU pinning / NUMA** | Pin RX thread to specific CPU core, set IRQ affinity to match. | `taskset` + `/proc/irq/*/smp_affinity`. Relevant on bare metal, likely no benefit on shared vCPU. |
-| **Busy-poll** | `SO_BUSY_POLL` / `SO_PREFER_BUSY_POLL` on the raw socket. Kernel spins in poll instead of sleeping. | Trades CPU for latency. Useful for dedicated machines, wasteful on shared VMs. |
-| **Zero-copy TAP** | `IFF_VNET_HDR` + `TUNSNDBUF` tuning. Potentially allow the kernel to DMA directly from pool buffers. | Needs investigation into Linux TAP zero-copy support. |
+Three bugs fixed: `IPV6_V6ONLY` invalid on raw sockets (EINVAL), TX batcher missing v6 fd, RX v6 using `read()` instead of `recvfrom()` (no source address for demux).
 
 ---
 
-## Implementation Order
+## Remaining Optimization Routes
 
-Recommended sequence based on risk/reward:
+### Route 5: RX Hot-Path Micro-Optimizations (Low Risk, Low-Medium Impact)
 
-1. **SO_RCVBUF/SO_SNDBUF tuning** — trivial change, immediate measurable impact
-2. **sendmmsg for TX** — low risk, completes the batch I/O story
-3. **writev on TAP** — medium risk, attacks the TAP write bottleneck
-4. **PACKET_MMAP (revisit)** — high risk, but highest potential payoff before XDP
-5. **io_uring / XDP** — future, requires significant architecture changes
+Code audit identified several per-packet inefficiencies in the RX hot path. Each is small, but they compound at high packet rates.
 
-Each route should be implemented as a **single commit**, benchmarked against the baseline, and only merged if it shows measurable improvement with no regression. The `feat/packet-mmap-wip` experience demonstrated what happens when multiple changes are bundled.
+| # | Optimization | File:Line | Risk | Est. Impact |
+|---|-------------|-----------|------|-------------|
+| 5a | **Avoid Arc clone per RX packet** — `registry.get()` clones Arc on every packet (2 atomic ops). Use `DashMap::get()` Ref guard directly. | `rx.rs:150` | Low | ~2 atomics/pkt |
+| 5b | **Shrink recvmmsg buffers** — 32 x 65536 = 2 MB heap per RX thread. Max EoIP frame is ~1542 bytes. Use ~2048-byte buffers for better cache locality. | `rx.rs:233` | Low | Cache hits |
+| 5c | **Use CLOCK_MONOTONIC_COARSE** — `SystemTime::now()` is a syscall. `CLOCK_MONOTONIC_COARSE` is vDSO (~4ns). Called every 64 packets. | `rx.rs:109` | Low | Fewer syscalls |
+| 5d | **Wire up `rx_workers` config** — Config defines `rx_workers` (default 1) but code hardcodes 2 v4 workers. | `rx.rs:46`, `config.rs:92` | Low | Config works |
+| 5e | **Wire up RX channel cap to config** — `RX_CHANNEL_CAP=1024` is hardcoded, ignores `PerformanceConfig.channel_buffer`. | `handle.rs:14` | Trivial | Config works |
+| 5f | **Size buffer pool properly** — Pool sized to `channel_buffer` (1024). Under sustained load with 2 RX threads + channel depth, pool exhaustion triggers heap fallback. | `main.rs:84` | Low | Fewer allocs |
+
+### Route 6: Receive Directly into Pool Buffers (Medium Risk, Medium Impact)
+
+**Current state:** `recvmmsg` receives into 65KB scratch buffers, then `process_v4_packet` copies the frame data into a pool buffer via `copy_from_slice`. This is one memcpy per RX packet that could be eliminated.
+
+**Proposed:** Pre-allocate pool buffers for the iovec array, receive directly into pool buffer payload areas. After decode, send the buffer to the TAP writer without copying.
+
+**Expected impact:** Eliminates one memcpy per RX packet (~1500 bytes). At 500K pps, this is ~750 MB/s of unnecessary memory bandwidth.
+
+**Complexity:** Medium. Buffer lifecycle changes — pool buffers must be returned if the packet is dropped (bad magic, demux miss, keepalive). Headroom management needs care.
+
+### Route 4: AF_PACKET + PACKET_MMAP (High Risk, High Impact)
+
+**Status:** Failed attempt on `feat/packet-mmap-wip`. See Post-Mortem above. Last resort.
+
+**Prerequisite:** All Route 5 and Route 6 optimizations should be exhausted first. Then validate `PACKET_IGNORE_OUTGOING` + simple BPF + SOCK_RAW + TPACKET_V3 in a standalone test program before integrating.
+
+### Route 7: Needs Research / Future
+
+| Optimization | Description | Prereq |
+|-------------|-------------|--------|
+| **io_uring** | Replace `recvmmsg`/`sendmmsg` with io_uring SQE batches. Zero syscall overhead. | Kernel >= 5.19 |
+| **GRO/GSO on TAP** | Kernel aggregates small packets into large ones before delivery to TAP. | Test with `ethtool -K tap0 gro on` |
+| **XDP redirect** | Full kernel data plane (Phase 10 PRD). Bypasses all userspace. | Significant arch change |
+| **CPU pinning** | Pin RX thread to CPU core, set IRQ affinity to match. | Bare metal only |
+| **Busy-poll** | `SO_BUSY_POLL` on raw socket. Trades CPU for latency. | Dedicated machines |
+| **Zero-copy TAP** | `IFF_VNET_HDR` + `TUNSNDBUF` tuning. | Research needed |
+| **recvmmsg for IPv6** | v6 RX uses blocking `recvfrom()`. Add batched receive. | Low risk, matches v4 path |
+
+---
+
+## Implementation Order (Remaining)
+
+1. **Route 5a-5f** (low risk micro-opts) — batch of 6 trivial-low changes, then full UAT
+2. **Route 6** (zero-copy RX into pool buffers) — medium risk, full UAT after
+3. **Route 4** (PACKET_MMAP revisit) — high risk, standalone validation first
+4. **Route 7** (io_uring / XDP) — future, requires architecture changes
 
 ---
 
 ## Success Criteria
 
-| Metric | Current | Target | Stretch |
-|--------|---------|--------|---------|
-| TX throughput | 500 Mbps | 550 Mbps | Link-speed |
-| RX throughput | 424 Mbps | 550 Mbps | Link-speed |
-| RX CPU (per Gbps) | ~48% | < 35% | < 20% |
-| Latency overhead | 190 us | < 150 us | < 100 us |
-| Cross-compat | Full | Full | Full |
+| Metric | Pre-opt (alpha.1) | Current (alpha.3) | Target | Stretch |
+|--------|-------------------|--------------------|--------|---------|
+| TX throughput | 369 Mbps | **570 Mbps** ✓ | 600 Mbps | Link-speed |
+| RX throughput | 279 Mbps | **456 Mbps** ✓ | 550 Mbps | Link-speed |
+| RX CPU (per Gbps) | ~74% | ~55% | < 35% | < 20% |
+| Latency overhead | ~190 us | ~190 us | < 150 us | < 100 us |
+| Cross-compat | Full | **Full** ✓ | Full | Full |
+| IPv6 transport | Broken | **Working** ✓ | Working | Working |
+| aarch64 support | None | **Working** ✓ | Working | Working |
 
-All measurements on Hetzner CPX22 with iperf3 single-stream TCP.
+All measurements on Hetzner CPX22 with iperf3 single-stream TCP, 3-round Latin square average.
