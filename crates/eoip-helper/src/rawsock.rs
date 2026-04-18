@@ -54,6 +54,28 @@ pub fn create_raw_socket_v4() -> Result<OwnedFd, EoipError> {
         }
     }
 
+    // SO_BUSY_POLL: kernel spins on socket for up to N µs before sleeping.
+    // Trades idle CPU for lower latency and fewer context switches under load.
+    // Only effective on dedicated machines; harmless on shared vCPU (kernel ignores
+    // if busy_poll sysctl is disabled). Available since Linux 3.11.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let busy_us: libc::c_int = 50; // 50 µs spin window
+        let ret = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                &busy_us as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&busy_us) as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            tracing::debug!("SO_BUSY_POLL not available (non-critical)");
+        }
+    }
+
     tracing::info!("created raw socket: AF_INET, SOCK_RAW, proto=47 (EoIP), ttl=255, df=0, bufs=4MB");
     Ok(OwnedFd::from(sock))
 }
@@ -78,6 +100,24 @@ pub fn create_raw_socket_v6() -> Result<OwnedFd, EoipError> {
 
     // Match MikroTik hop limit of 255 (IPv6 equivalent of TTL).
     sock.set_unicast_hops_v6(255)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let busy_us: libc::c_int = 50;
+        let ret = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                &busy_us as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&busy_us) as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            tracing::debug!("SO_BUSY_POLL not available on v6 socket (non-critical)");
+        }
+    }
 
     tracing::info!("created raw socket: AF_INET6, SOCK_RAW, proto=97 (EtherIP), hops=255, bufs=4MB");
     Ok(OwnedFd::from(sock))

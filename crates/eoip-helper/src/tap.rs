@@ -52,8 +52,12 @@ pub fn create_tap_interface(name: &str) -> Result<OwnedFd, EoipError> {
     let mut ifr = Ifreq::new();
     let name_bytes = name.as_bytes();
     ifr.ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
-    // IFF_TAP = 0x0002, IFF_NO_PI = 0x1000
-    ifr.ifr_ifru.ifr_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as i16;
+    // IFF_TAP = 0x0002, IFF_NO_PI = 0x1000, IFF_NAPI = 0x0010
+    // IFF_NAPI enables a dedicated NAPI instance for packets written to TAP,
+    // allowing kernel-side batching and GRO coalescing instead of using the
+    // shared per-CPU backlog queue. Available since Linux ~4.15.
+    const IFF_NAPI: i32 = 0x0010;
+    ifr.ifr_ifru.ifr_flags = (libc::IFF_TAP | libc::IFF_NO_PI | IFF_NAPI) as i16;
 
     // TUNSETIFF ioctl
     let ret = unsafe { libc::ioctl(owned_fd.as_raw_fd(), TUNSETIFF, &ifr) };

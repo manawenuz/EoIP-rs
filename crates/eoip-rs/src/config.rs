@@ -180,6 +180,10 @@ pub struct PerformanceConfig {
     pub channel_buffer: usize,
     #[serde(default = "default_rx_workers")]
     pub rx_workers: usize,
+    /// Pin RX/TX threads to specific CPU cores. Empty = no pinning (default).
+    /// Example: [0, 1] pins first RX worker to CPU 0, second to CPU 1.
+    #[serde(default)]
+    pub cpu_affinity: Vec<usize>,
 }
 
 impl Default for PerformanceConfig {
@@ -191,6 +195,7 @@ impl Default for PerformanceConfig {
             batch_timeout_us: default_batch_timeout_us(),
             channel_buffer: default_channel_buffer(),
             rx_workers: default_rx_workers(),
+            cpu_affinity: Vec::new(),
         }
     }
 }
