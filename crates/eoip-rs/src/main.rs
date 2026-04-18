@@ -81,7 +81,6 @@ async fn run(args: Args) -> Result<(), DaemonError> {
     // Bootstrap: create first tunnel from config to get raw socket fds
     let mut raw_v4_fd: Option<OwnedFd> = None;
     let mut raw_v6_fd: Option<OwnedFd> = None;
-    let mut af_packet_fd: Option<OwnedFd> = None;
     let pool = Arc::new(BufferPool::new(config.performance.channel_buffer));
     let (tx_sender, tx_receiver) = mpsc::channel::<TxPacket>(config.performance.channel_buffer);
 
@@ -156,20 +155,6 @@ async fn run(args: Args) -> Result<(), DaemonError> {
                     _ => {}
                 }
             }
-
-            // Try AF_PACKET for zero-copy PACKET_MMAP RX (may fail, that's ok)
-            if let Ok((msg, fd)) = fdpass::recv_msg_with_fd(helper_fd) {
-                match msg {
-                    HelperMsg::RawSocket { address_family: 17 } => {
-                        tracing::info!("AF_PACKET socket ready (PACKET_MMAP zero-copy RX available)");
-                        af_packet_fd = fd.map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
-                    }
-                    HelperMsg::Error { msg } => {
-                        tracing::warn!(%msg, "AF_PACKET not available, will use recvmmsg fallback");
-                    }
-                    _ => {}
-                }
-            }
         }
 
         let _ = handle.state.transition(TunnelState::Initializing, TunnelState::Configured);
@@ -183,7 +168,6 @@ async fn run(args: Args) -> Result<(), DaemonError> {
     let _rx_handle = rx::start_rx_pipeline(
         raw_v4_fd.as_ref().map(|fd| fd.as_fd()),
         raw_v6_fd.as_ref().map(|fd| fd.as_fd()),
-        af_packet_fd.as_ref().map(|fd| fd.as_fd()),
         Arc::clone(&registry),
         Arc::clone(&pool),
         shutdown.token().clone(),

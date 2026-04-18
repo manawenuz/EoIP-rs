@@ -19,11 +19,9 @@ use eoip_helper::tap;
 use eoip_proto::wire::{DaemonMsg, HelperMsg};
 use eoip_proto::EoipError;
 
-// AF_INET = 2, AF_INET6 = 10, AF_PACKET = 17
+// AF_INET = 2, AF_INET6 = 10
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
-#[cfg(target_os = "linux")]
-const AF_PACKET: u16 = 17;
 
 #[derive(Parser, Debug)]
 #[command(name = "eoip-helper", version, about = "EoIP-rs privileged helper")]
@@ -95,14 +93,10 @@ fn run(args: Args) -> Result<(), EoipError> {
     // Create shared raw sockets (one per address family, shared by all tunnels)
     let mut raw_v4_created = false;
     let mut raw_v6_created = false;
-    #[cfg(target_os = "linux")]
-    let mut af_packet_created = false;
-    #[cfg(not(target_os = "linux"))]
-    let mut af_packet_created = true; // skip on non-Linux
 
     match args.mode {
-        Mode::Exit => run_exit_mode(sock, &mut raw_v4_created, &mut raw_v6_created, &mut af_packet_created),
-        Mode::Persist => run_persist_mode(sock, &mut raw_v4_created, &mut raw_v6_created, &mut af_packet_created),
+        Mode::Exit => run_exit_mode(sock, &mut raw_v4_created, &mut raw_v6_created),
+        Mode::Persist => run_persist_mode(sock, &mut raw_v4_created, &mut raw_v6_created),
     }
 }
 
@@ -110,7 +104,6 @@ fn run_exit_mode(
     sock: std::os::fd::BorrowedFd<'_>,
     raw_v4_created: &mut bool,
     raw_v6_created: &mut bool,
-    af_packet_created: &mut bool,
 ) -> Result<(), EoipError> {
     // In exit mode, we wait for commands until we get Shutdown
     fdpass::send_msg(sock, &HelperMsg::HelperReady)?;
@@ -129,7 +122,6 @@ fn run_exit_mode(
                     tunnel_id,
                     raw_v4_created,
                     raw_v6_created,
-                    af_packet_created,
                 )?;
             }
             DaemonMsg::DestroyTunnel { iface_name } => {
@@ -147,7 +139,6 @@ fn run_persist_mode(
     sock: std::os::fd::BorrowedFd<'_>,
     raw_v4_created: &mut bool,
     raw_v6_created: &mut bool,
-    af_packet_created: &mut bool,
 ) -> Result<(), EoipError> {
     fdpass::send_msg(sock, &HelperMsg::HelperReady)?;
     tracing::info!("sent HelperReady, entering persist loop");
@@ -183,7 +174,6 @@ fn run_persist_mode(
                     tunnel_id,
                     raw_v4_created,
                     raw_v6_created,
-                    af_packet_created,
                 ) {
                     tracing::error!(%e, interface = %iface_name, "failed to create tunnel");
                     let _ = fdpass::send_msg(
@@ -211,7 +201,6 @@ fn handle_create_tunnel(
     tunnel_id: u16,
     raw_v4_created: &mut bool,
     raw_v6_created: &mut bool,
-    _af_packet_created: &mut bool,
 ) -> Result<(), EoipError> {
     tracing::info!(interface = %iface_name, tunnel_id, "creating tunnel resources");
 
@@ -240,55 +229,15 @@ fn handle_create_tunnel(
     }
 
     if !*raw_v6_created {
-        match rawsock::create_raw_socket_v6() {
-            Ok(raw_v6) => {
-                fdpass::send_msg_with_fd(
-                    sock,
-                    &HelperMsg::RawSocket {
-                        address_family: AF_INET6,
-                    },
-                    raw_v6.as_fd(),
-                )?;
-                *raw_v6_created = true;
-            }
-            Err(e) => {
-                tracing::warn!("IPv6 raw socket not available: {e} (non-critical, IPv4 tunnels unaffected)");
-                // Send error so daemon knows to skip v6
-                let _ = fdpass::send_msg(
-                    sock,
-                    &HelperMsg::Error {
-                        msg: format!("IPv6 raw socket: {e}"),
-                    },
-                );
-            }
-        }
-    }
-
-    // AF_PACKET socket for zero-copy PACKET_MMAP RX (non-fatal if unavailable)
-    #[cfg(target_os = "linux")]
-    if !*_af_packet_created {
-        match rawsock::create_af_packet_socket_v4() {
-            Ok(af_fd) => {
-                fdpass::send_msg_with_fd(
-                    sock,
-                    &HelperMsg::RawSocket {
-                        address_family: AF_PACKET,
-                    },
-                    af_fd.as_fd(),
-                )?;
-                tracing::info!("AF_PACKET socket sent to daemon");
-            }
-            Err(e) => {
-                tracing::warn!(%e, "AF_PACKET not available, daemon will use recvmmsg fallback");
-                fdpass::send_msg(
-                    sock,
-                    &HelperMsg::Error {
-                        msg: format!("AF_PACKET: {e}"),
-                    },
-                )?;
-            }
-        }
-        *_af_packet_created = true;
+        let raw_v6 = rawsock::create_raw_socket_v6()?;
+        fdpass::send_msg_with_fd(
+            sock,
+            &HelperMsg::RawSocket {
+                address_family: AF_INET6,
+            },
+            raw_v6.as_fd(),
+        )?;
+        *raw_v6_created = true;
     }
 
     Ok(())

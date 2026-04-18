@@ -29,47 +29,20 @@ pub struct RxPipelineHandle {
 pub type TunnelRxSender = Sender<PacketBuf>;
 
 /// Batch size for recvmmsg.
-#[cfg(target_os = "linux")]
 const RECV_BATCH: usize = 32;
 
 /// Start the RX pipeline: spawn dedicated OS threads for v4 and v6 raw sockets.
-///
-/// If `af_packet_v4` is provided, uses PACKET_MMAP (TPACKET_V3) for zero-copy
-/// IPv4/GRE receive. Falls back to `recvmmsg` on the raw v4 socket otherwise.
 pub fn start_rx_pipeline(
     raw_v4: Option<BorrowedFd<'_>>,
     raw_v6: Option<BorrowedFd<'_>>,
-    af_packet_v4: Option<BorrowedFd<'_>>,
     registry: Arc<TunnelRegistry>,
     pool: Arc<BufferPool>,
     shutdown: CancellationToken,
 ) -> RxPipelineHandle {
-    // Try PACKET_MMAP for IPv4 RX (zero-copy), fall back to recvmmsg workers
-    #[cfg(target_os = "linux")]
-    let v4_mmap_thread = af_packet_v4.map(|fd| {
-        let af_fd = fd.as_raw_fd();
-        let registry = Arc::clone(&registry);
-        let pool = Arc::clone(&pool);
-        let shutdown = shutdown.clone();
-        std::thread::Builder::new()
-            .name("rx-v4-mmap".into())
-            .spawn(move || rx_loop_v4_mmap(af_fd, &registry, &pool, &shutdown))
-            .expect("failed to spawn PACKET_MMAP RX thread")
-    });
-
-    #[cfg(not(target_os = "linux"))]
-    let v4_mmap_thread: Option<std::thread::JoinHandle<()>> = None;
-    #[cfg(not(target_os = "linux"))]
-    let _ = af_packet_v4;
-
-    // Only spawn recvmmsg workers if PACKET_MMAP is not in use
-    let v4_threads = if v4_mmap_thread.is_some() {
-        // PACKET_MMAP handles all v4 RX — no need for recvmmsg workers
-        tracing::info!("IPv4 RX using PACKET_MMAP (zero-copy)");
-        vec![]
-    } else if let Some(fd) = raw_v4 {
+    // Spawn multiple v4 workers for parallelism
+    // Each reads from the same fd — the kernel distributes packets
+    let v4_threads = if let Some(fd) = raw_v4 {
         let raw_fd = fd.as_raw_fd();
-        tracing::info!("IPv4 RX using recvmmsg (no AF_PACKET socket)");
         (0..2)
             .map(|i| {
                 let registry = Arc::clone(&registry);
@@ -85,12 +58,6 @@ pub fn start_rx_pipeline(
         vec![]
     };
 
-    // Include PACKET_MMAP thread in the v4 thread list for join
-    let mut all_v4_threads = v4_threads;
-    if let Some(t) = v4_mmap_thread {
-        all_v4_threads.push(t);
-    }
-
     let v6_thread = raw_v6.map(|fd| {
         let raw_fd = fd.as_raw_fd();
         let registry = Arc::clone(&registry);
@@ -102,7 +69,7 @@ pub fn start_rx_pipeline(
             .expect("failed to spawn RX v6 thread")
     });
 
-    RxPipelineHandle { v4_threads: all_v4_threads, v6_thread }
+    RxPipelineHandle { v4_threads, v6_thread }
 }
 
 /// Rate-limited demux miss logging.
@@ -343,46 +310,6 @@ fn try_rx_loop_recvmmsg(
     }
 
     true
-}
-
-/// EoIP (IPv4) receive loop using AF_PACKET + TPACKET_V3 ring buffer (zero-copy).
-///
-/// The kernel writes packets directly into the mmap'd ring buffer. We read
-/// them in place and only copy the Ethernet frame into a `PacketBuf` for the
-/// crossbeam channel to the TAP writer. This eliminates the `recvmmsg` syscall
-/// and its associated kernel→userspace memcpy.
-#[cfg(target_os = "linux")]
-fn rx_loop_v4_mmap(
-    af_packet_fd: std::os::fd::RawFd,
-    registry: &TunnelRegistry,
-    pool: &BufferPool,
-    shutdown: &CancellationToken,
-) {
-    use crate::packet::packet_mmap::PacketMmapRing;
-
-    let mut ring = match PacketMmapRing::new(af_packet_fd) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(%e, "failed to set up PACKET_MMAP ring, falling back to recvmmsg");
-            // Fall back to recvmmsg on the same fd won't work (it's AF_PACKET).
-            // The caller should have a raw socket fallback. Just exit this thread.
-            return;
-        }
-    };
-
-    tracing::info!("RX v4 PACKET_MMAP worker started (zero-copy)");
-
-    loop {
-        if shutdown.is_cancelled() {
-            break;
-        }
-
-        ring.process_block(500, |data, len| {
-            process_v4_packet(data, len, registry, pool);
-        });
-    }
-
-    tracing::info!("RX v4 PACKET_MMAP worker stopped");
 }
 
 /// EoIPv6 (IPv6, protocol 97) receive loop.
