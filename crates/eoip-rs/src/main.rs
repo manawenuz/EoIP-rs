@@ -171,6 +171,21 @@ async fn run(args: Args) -> Result<(), DaemonError> {
         startup_tunnels.push((tunnel_id, tap));
     }
 
+    // Create AF_PACKET socket for PACKET_MMAP zero-copy RX (directly in daemon)
+    #[cfg(target_os = "linux")]
+    let af_packet_fd: Option<OwnedFd> = match eoip_helper::rawsock::create_af_packet_socket_v4() {
+        Ok(fd) => {
+            tracing::info!("AF_PACKET socket created for zero-copy RX");
+            Some(fd)
+        }
+        Err(e) => {
+            tracing::info!(%e, "AF_PACKET not available, using recvmmsg");
+            None
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let af_packet_fd: Option<OwnedFd> = None;
+
     // Start RX pipeline
     let _rx_handle = rx::start_rx_pipeline(
         raw_v4_fd.as_ref().map(|fd| fd.as_fd()),
