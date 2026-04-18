@@ -73,7 +73,7 @@ async fn cmd_add(
         local_addr: local.unwrap_or_else(|| "0.0.0.0".into()),
         remote_addr: remote,
         iface_name: name.unwrap_or_else(|| format!("eoip{tunnel_id}")),
-        mtu: mtu.unwrap_or(1458),
+        mtu: mtu.unwrap_or(0), // 0 = auto-detect
     };
     let resp = client.tunnels.create_tunnel(req).await?;
     let tunnel = resp.into_inner().tunnel.unwrap();

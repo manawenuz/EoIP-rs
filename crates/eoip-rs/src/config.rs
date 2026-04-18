@@ -1,11 +1,101 @@
 //! TOML configuration file parsing and validation.
 
+use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::DaemonError;
+
+/// MTU configuration: auto-detect or explicit override.
+#[derive(Debug, Clone)]
+pub enum MtuConfig {
+    /// Auto-detect from outgoing interface (PMTUD when available).
+    Auto,
+    /// Explicit overlay MTU value.
+    Fixed(u16),
+}
+
+impl MtuConfig {
+    /// Resolve to a concrete overlay MTU value.
+    ///
+    /// For `Auto`, detects the outgoing interface MTU and subtracts EoIP overhead.
+    /// For `Fixed`, returns the configured value directly.
+    pub fn resolve(&self, remote: IpAddr) -> u16 {
+        match self {
+            MtuConfig::Auto => crate::net::mtu::auto_overlay_mtu(remote),
+            MtuConfig::Fixed(v) => *v,
+        }
+    }
+
+    /// Returns `true` if this is auto-detection mode.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, MtuConfig::Auto)
+    }
+}
+
+impl Default for MtuConfig {
+    fn default() -> Self {
+        MtuConfig::Auto
+    }
+}
+
+impl fmt::Display for MtuConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MtuConfig::Auto => write!(f, "auto"),
+            MtuConfig::Fixed(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MtuConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct MtuVisitor;
+
+        impl<'de> de::Visitor<'de> for MtuVisitor {
+            type Value = MtuConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a positive integer or the string \"auto\"")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<MtuConfig, E> {
+                if v == 0 {
+                    Ok(MtuConfig::Auto)
+                } else if v > u16::MAX as u64 {
+                    Err(E::custom(format!("MTU {v} exceeds maximum {}", u16::MAX)))
+                } else {
+                    Ok(MtuConfig::Fixed(v as u16))
+                }
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<MtuConfig, E> {
+                if v < 0 {
+                    Err(E::custom(format!("MTU cannot be negative: {v}")))
+                } else {
+                    self.visit_u64(v as u64)
+                }
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<MtuConfig, E> {
+                if v.eq_ignore_ascii_case("auto") {
+                    Ok(MtuConfig::Auto)
+                } else {
+                    Err(E::custom(format!("expected \"auto\" or a number, got \"{v}\"")))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(MtuVisitor)
+    }
+}
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -113,14 +203,16 @@ pub struct TunnelConfig {
     pub remote: IpAddr,
     #[serde(default)]
     pub iface_name: Option<String>,
-    #[serde(default = "default_mtu")]
-    pub mtu: u16,
+    #[serde(default)]
+    pub mtu: MtuConfig,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_keepalive_interval_secs")]
     pub keepalive_interval_secs: u64,
     #[serde(default = "default_keepalive_timeout_secs")]
     pub keepalive_timeout_secs: u64,
+    #[serde(default = "default_clamp_tcp_mss")]
+    pub clamp_tcp_mss: bool,
 }
 
 impl TunnelConfig {
@@ -147,8 +239,8 @@ fn default_max_batch_size() -> usize { 64 }
 fn default_batch_timeout_us() -> u64 { 50 }
 fn default_channel_buffer() -> usize { 1024 }
 fn default_rx_workers() -> usize { 1 }
-fn default_mtu() -> u16 { 1458 }
 fn default_enabled() -> bool { true }
+fn default_clamp_tcp_mss() -> bool { true }
 fn default_keepalive_interval_secs() -> u64 { 10 }
 fn default_keepalive_timeout_secs() -> u64 { 100 }
 
@@ -343,5 +435,52 @@ remote = "10.0.0.2"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.tunnels[0].keepalive_interval_secs, 10);
         assert_eq!(config.tunnels[0].keepalive_timeout_secs, 100);
+    }
+
+    #[test]
+    fn mtu_auto_when_absent() {
+        let toml = r#"
+[[tunnel]]
+tunnel_id = 1
+local = "10.0.0.1"
+remote = "10.0.0.2"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.tunnels[0].mtu.is_auto());
+    }
+
+    #[test]
+    fn mtu_auto_string() {
+        let toml = r#"
+[[tunnel]]
+tunnel_id = 1
+local = "10.0.0.1"
+remote = "10.0.0.2"
+mtu = "auto"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.tunnels[0].mtu.is_auto());
+    }
+
+    #[test]
+    fn mtu_fixed_integer() {
+        let toml = r#"
+[[tunnel]]
+tunnel_id = 1
+local = "10.0.0.1"
+remote = "10.0.0.2"
+mtu = 1400
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        match config.tunnels[0].mtu {
+            MtuConfig::Fixed(v) => assert_eq!(v, 1400),
+            MtuConfig::Auto => panic!("expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn mtu_display() {
+        assert_eq!(MtuConfig::Auto.to_string(), "auto");
+        assert_eq!(MtuConfig::Fixed(1458).to_string(), "1458");
     }
 }

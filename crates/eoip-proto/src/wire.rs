@@ -36,6 +36,10 @@ pub enum DaemonMsg {
     CreateTunnel {
         iface_name: String,
         tunnel_id: u16,
+        /// Overlay MTU to set on the TAP interface (0 = skip).
+        mtu: u16,
+        /// Whether to add an iptables TCP MSS clamping rule for this interface.
+        clamp_tcp_mss: bool,
     },
     /// Request destruction of a TAP interface.
     DestroyTunnel {
@@ -120,6 +124,8 @@ mod tests {
         let msg = DaemonMsg::CreateTunnel {
             iface_name: "eoip-dc1".into(),
             tunnel_id: 42,
+            mtu: 1458,
+            clamp_tcp_mss: true,
         };
         let bytes = serialize_msg(&msg).unwrap();
         let decoded: DaemonMsg = deserialize_msg(&bytes).unwrap();
@@ -127,9 +133,13 @@ mod tests {
             DaemonMsg::CreateTunnel {
                 iface_name,
                 tunnel_id,
+                mtu,
+                clamp_tcp_mss,
             } => {
                 assert_eq!(iface_name, "eoip-dc1");
                 assert_eq!(tunnel_id, 42);
+                assert_eq!(mtu, 1458);
+                assert!(clamp_tcp_mss);
             }
             _ => panic!("wrong variant"),
         }
@@ -161,6 +171,8 @@ mod tests {
         let msg = DaemonMsg::CreateTunnel {
             iface_name: "eoip-dc1".into(),
             tunnel_id: 100,
+            mtu: 1458,
+            clamp_tcp_mss: true,
         };
         let bytes = serialize_msg(&msg).unwrap();
         assert!(bytes.len() < 100, "serialized size: {}", bytes.len());

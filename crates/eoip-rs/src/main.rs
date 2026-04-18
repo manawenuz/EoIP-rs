@@ -96,10 +96,22 @@ async fn run(args: Args) -> Result<(), DaemonError> {
             continue;
         }
 
+        // Resolve MTU: auto-detect or use explicit config value.
+        let resolved_mtu = tunnel_cfg.mtu.resolve(tunnel_cfg.remote);
+        if tunnel_cfg.mtu.is_auto() {
+            tracing::info!(
+                tunnel_id = tunnel_cfg.tunnel_id,
+                remote = %tunnel_cfg.remote,
+                overlay_mtu = resolved_mtu,
+                "auto-detected overlay MTU"
+            );
+        }
+
         let handle = Arc::new(eoip_rs::tunnel::handle::TunnelHandle::with_channel_cap(
             tunnel_cfg.clone(),
             config.performance.channel_buffer,
         ));
+        handle.actual_mtu.store(resolved_mtu, std::sync::atomic::Ordering::Relaxed);
         let key = eoip_proto::DemuxKey {
             tunnel_id: tunnel_cfg.tunnel_id,
             peer_addr: tunnel_cfg.remote,
@@ -113,6 +125,8 @@ async fn run(args: Args) -> Result<(), DaemonError> {
         let create_msg = DaemonMsg::CreateTunnel {
             iface_name: iface_name.clone(),
             tunnel_id,
+            mtu: resolved_mtu,
+            clamp_tcp_mss: tunnel_cfg.clamp_tcp_mss,
         };
         let payload = eoip_proto::wire::serialize_msg(&create_msg)?;
         let iov = [std::io::IoSlice::new(&payload)];
@@ -255,6 +269,15 @@ async fn run(args: Args) -> Result<(), DaemonError> {
             // Keepalive
             let raw_fd = if handle.config.remote.is_ipv6() { raw_v6_raw } else { raw_v4_raw };
             keepalive::spawn_keepalive_task(Arc::clone(handle), raw_fd, tunnel_cancel.clone());
+
+            // Spawn PMTUD task for auto-MTU tunnels.
+            if handle.config.mtu.is_auto() {
+                eoip_rs::net::pmtud::spawn_pmtud_task(
+                    Arc::clone(handle),
+                    handle.config.remote,
+                    tunnel_cancel.clone(),
+                );
+            }
 
             manager.register_startup_tunnel(*tunnel_id, tunnel_cancel, Arc::clone(tap));
         }

@@ -38,16 +38,20 @@ impl TunnelServiceImpl {
             crate::tunnel::lifecycle::TunnelState::Destroyed => TunnelState::Destroyed,
         };
 
+        let actual = handle.actual_mtu.load(std::sync::atomic::Ordering::Relaxed);
+        let configured_mtu = handle.config.mtu.resolve(key.peer_addr);
+
         Tunnel {
             tunnel_id: handle.config.tunnel_id as u32,
             local_addr: handle.config.local.to_string(),
             remote_addr: key.peer_addr.to_string(),
             iface_name: handle.config.effective_iface_name(),
-            mtu: handle.config.mtu as u32,
+            mtu: configured_mtu as u32,
             enabled: handle.config.enabled,
             state: state.into(),
             keepalive_interval_secs: handle.config.keepalive_interval_secs as u32,
             keepalive_timeout_secs: handle.config.keepalive_timeout_secs as u32,
+            actual_mtu: if actual > 0 { actual as u32 } else { configured_mtu as u32 },
         }
     }
 }
@@ -70,10 +74,15 @@ impl tunnel_service_server::TunnelService for TunnelServiceImpl {
             local,
             remote,
             iface_name: if req.iface_name.is_empty() { None } else { Some(req.iface_name) },
-            mtu: if req.mtu == 0 { 1458 } else { req.mtu as u16 },
+            mtu: if req.mtu == 0 {
+                crate::config::MtuConfig::Auto
+            } else {
+                crate::config::MtuConfig::Fixed(req.mtu as u16)
+            },
             enabled: true,
             keepalive_interval_secs: 10,
             keepalive_timeout_secs: 100,
+            clamp_tcp_mss: true,
         };
 
         self.manager.create_tunnel(config).await

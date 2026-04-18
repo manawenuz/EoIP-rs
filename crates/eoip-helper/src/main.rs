@@ -14,6 +14,7 @@ use clap::{Parser, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use eoip_helper::fdpass;
+use eoip_helper::mss;
 use eoip_helper::rawsock;
 use eoip_helper::tap;
 use eoip_proto::wire::{DaemonMsg, HelperMsg};
@@ -115,11 +116,15 @@ fn run_exit_mode(
             DaemonMsg::CreateTunnel {
                 iface_name,
                 tunnel_id,
+                mtu,
+                clamp_tcp_mss,
             } => {
                 handle_create_tunnel(
                     sock,
                     &iface_name,
                     tunnel_id,
+                    mtu,
+                    clamp_tcp_mss,
                     raw_v4_created,
                     raw_v6_created,
                 )?;
@@ -167,11 +172,15 @@ fn run_persist_mode(
             DaemonMsg::CreateTunnel {
                 iface_name,
                 tunnel_id,
+                mtu,
+                clamp_tcp_mss,
             } => {
                 if let Err(e) = handle_create_tunnel(
                     sock,
                     &iface_name,
                     tunnel_id,
+                    mtu,
+                    clamp_tcp_mss,
                     raw_v4_created,
                     raw_v6_created,
                 ) {
@@ -199,13 +208,27 @@ fn handle_create_tunnel(
     sock: std::os::fd::BorrowedFd<'_>,
     iface_name: &str,
     tunnel_id: u16,
+    mtu: u16,
+    clamp_tcp_mss: bool,
     raw_v4_created: &mut bool,
     raw_v6_created: &mut bool,
 ) -> Result<(), EoipError> {
-    tracing::info!(interface = %iface_name, tunnel_id, "creating tunnel resources");
+    tracing::info!(interface = %iface_name, tunnel_id, mtu, clamp_tcp_mss, "creating tunnel resources");
 
     // Create TAP interface
     let tap_fd = tap::create_tap_interface(iface_name)?;
+
+    // Set MTU on the TAP interface (skip if 0)
+    if mtu > 0 {
+        tap::set_interface_mtu(iface_name, mtu)?;
+    }
+
+    // Add TCP MSS clamping rule
+    if clamp_tcp_mss {
+        if let Err(e) = mss::add_mss_clamp_rule(iface_name) {
+            tracing::warn!(interface = %iface_name, %e, "failed to add MSS clamp rule (non-fatal)");
+        }
+    }
     fdpass::send_msg_with_fd(
         sock,
         &HelperMsg::TapCreated {
