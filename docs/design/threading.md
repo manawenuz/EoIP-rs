@@ -5,36 +5,42 @@
 EoIP-rs uses a **hybrid model**: tokio multi-threaded runtime for management, control plane, and TX path, combined with dedicated OS threads for the latency-sensitive RX hot path.
 
 ```
- ┌─────────────────────────────────────────────────────────────────┐
- │                        Process                                  │
- │                                                                 │
- │  ┌─────────────────────────────────────────────────────────┐    │
- │  │              Tokio Runtime (N worker threads)           │    │
- │  │                                                         │    │
- │  │   ┌──────────┐  ┌────────────────┐  ┌──────────────┐   │    │
- │  │   │  gRPC    │  │ Tunnel Manager │  │  TX Tasks    │   │    │
- │  │   │  Server  │  │ (create/del)   │  │  (per-tunnel │   │    │
- │  │   │          │  │                │  │   TAP read   │   │    │
- │  │   │          │  │                │  │   + batch)   │   │    │
- │  │   └──────────┘  └────────────────┘  └──────┬───────┘   │    │
- │  │                                            │            │    │
- │  └────────────────────────────────────────────┼────────────┘    │
- │                                               │                 │
- │       ┌───────────────────────────────────────┘                 │
- │       │         Shared Raw Socket(s)                            │
- │       │         (proto 47 / proto 97)                           │
- │       └───────────┬─────────────────────────────────────┐       │
- │                   │                                     │       │
- │  ┌────────────────┴──────────────────┐  ┌──────────────┴────┐  │
- │  │  Dedicated RX Thread (proto 47)   │  │  RX Thread (97)  │  │
- │  │  recvmmsg → demux → channel → TAP │  │  (same pattern)  │  │
- │  └───────────────────────────────────┘  └───────────────────┘  │
- └─────────────────────────────────────────────────────────────────┘
+ +---------------------------------------------------------------------+
+ |                        Process                                       |
+ |                                                                      |
+ |  +---------------------------------------------------------+        |
+ |  |              Tokio Runtime (N worker threads)            |        |
+ |  |                                                          |        |
+ |  |   +----------+  +----------------+  +--------------+    |        |
+ |  |   |  gRPC    |  | Tunnel Manager |  |  TX Tasks    |    |        |
+ |  |   |  Server  |  | (create/del)   |  |  (per-tunnel |    |        |
+ |  |   |          |  |                |  |   TAP read   |    |        |
+ |  |   |          |  |                |  |   + batch)   |    |        |
+ |  |   +----------+  +----------------+  +------+-------+    |        |
+ |  |                                            |             |        |
+ |  |   +------------------+                     |             |        |
+ |  |   | IPsec Monitor    |                     |             |        |
+ |  |   | (per IPsec tun)  |                     |             |        |
+ |  |   | SA poll via VICI |                     |             |        |
+ |  |   +------------------+                     |             |        |
+ |  |                                            |             |        |
+ |  +--------------------------------------------+-------------+        |
+ |                                               |                      |
+ |       +---------------------------------------+                      |
+ |       |         Shared Raw Socket(s)                                 |
+ |       |         (proto 47 / proto 97)                                |
+ |       +-----------+-----------------------------------------+        |
+ |                   |                                         |        |
+ |  +----------------+----------------------+  +---------------+-----+  |
+ |  |  Dedicated RX Thread (proto 47)       |  |  RX Thread (97)    |  |
+ |  |  recvmmsg -> demux -> channel -> TAP  |  |  (same pattern)   |  |
+ |  +---------------------------------------+  +---------------------+  |
+ +---------------------------------------------------------------------+
 ```
 
 ### Why This Layout
 
-- **RX threads are dedicated OS threads**, not tokio tasks. The RX loop calls `recvmmsg()` in a tight loop — putting this on a tokio worker would starve other tasks due to cooperative scheduling.
+- **RX threads are dedicated OS threads**, not tokio tasks. The RX loop calls `recvmmsg()` in a tight loop -- putting this on a tokio worker would starve other tasks due to cooperative scheduling.
 - **TX path uses tokio tasks** because TAP reads are event-driven (epoll-wakeup), not busy-polling.
 - **Per-tunnel threads would not scale**: all tunnels share one raw socket per protocol. There's no per-tunnel fd to epoll on for RX.
 
@@ -47,6 +53,9 @@ EoIP-rs uses a **hybrid model**: tokio multi-threaded runtime for management, co
 | RX thread (EtherIP/97) | 1 (only if IPv6 tunnels exist) | Same |
 | TAP reader task | 1 per tunnel | Automatic |
 | TX batcher task | 1 per protocol | Automatic |
+| IPsec monitor task | 1 per IPsec-enabled tunnel | Automatic |
+
+**Note on IPsec and RX path:** When `ipsec_secret` is active on a tunnel, the RX path uses raw socket `recvmmsg()` instead of AF_PACKET/PACKET_MMAP. AF_PACKET captures packets before kernel XFRM decryption, so it would see ESP-encrypted packets rather than decoded GRE. The raw socket path receives post-XFRM decrypted GRE packets correctly.
 
 ---
 
@@ -55,24 +64,24 @@ EoIP-rs uses a **hybrid model**: tokio multi-threaded runtime for management, co
 ### State Machine
 
 ```
-                         ┌─────────────┐
-          packet arrives │             │ flush_timer fires
-         ┌──────────────►│   FILLING   ├──────────────────┐
-         │               │             │                   │
-         │               └──────┬──────┘                   │
-         │                      │                          │
-         │         batch.len >= max_batch_size              │
-         │         OR queue_depth > high_water              │
-         │                      │                          │
-         │                      v                          v
-         │               ┌─────────────┐           ┌─────────────┐
-         │               │  FLUSHING   │           │  FLUSHING   │
-         │               │  (full)     │           │  (timer)    │
-         │               └──────┬──────┘           └──────┬──────┘
-         │                      │                          │
-         │               sendmmsg(batch)            sendmmsg(batch)
-         │                      │                          │
-         └──────────────────────┴──────────────────────────┘
+                         +-------------+
+          packet arrives |             | flush_timer fires
+         +-------------->|   FILLING   +------------------+
+         |               |             |                   |
+         |               +------+------+                   |
+         |                      |                          |
+         |         batch.len >= max_batch_size              |
+         |         OR queue_depth > high_water              |
+         |                      |                          |
+         |                      v                          v
+         |               +-------------+           +-------------+
+         |               |  FLUSHING   |           |  FLUSHING   |
+         |               |  (full)     |           |  (timer)    |
+         |               +------+------+           +------+------+
+         |                      |                          |
+         |               sendmmsg(batch)            sendmmsg(batch)
+         |                      |                          |
+         +----------------------+--------------------------+
                           reset batch, restart timer
 ```
 
@@ -95,12 +104,12 @@ impl BatchState {
     fn on_packet(&mut self, pkt: Packet, queue_depth: usize) -> Action {
         self.batch.push(pkt);
 
-        // Full batch → flush immediately
+        // Full batch -> flush immediately
         if self.batch.len() >= self.config.max_batch_size {
             return Action::FlushNow;
         }
 
-        // Under pressure → tighter deadline
+        // Under pressure -> tighter deadline
         if queue_depth > self.config.queue_depth_threshold {
             self.flush_deadline = min(
                 self.flush_deadline,
@@ -109,12 +118,12 @@ impl BatchState {
             return Action::Wait;
         }
 
-        // First packet, no backlog → send immediately (latency-optimized)
+        // First packet, no backlog -> send immediately (latency-optimized)
         if self.batch.len() == 1 && queue_depth == 0 {
             return Action::FlushNow;
         }
 
-        // First packet with backlog → set deadline
+        // First packet with backlog -> set deadline
         if self.batch.len() == 1 {
             self.flush_deadline = Instant::now() + self.config.flush_interval;
         }
@@ -139,9 +148,9 @@ enum Action { FlushNow, Wait }
 
 | Parameter | Default | Range | Effect |
 |-----------|---------|-------|--------|
-| `max_batch_size` | 64 | 1–1024 | sendmmsg vlen upper bound |
-| `flush_interval_us` | 100 | 1–10000 | Timer deadline for partial batches |
-| `queue_depth_threshold` | 32 | 0–4096 | Backlog level triggering batch mode |
+| `max_batch_size` | 64 | 1-1024 | sendmmsg vlen upper bound |
+| `flush_interval_us` | 100 | 1-10000 | Timer deadline for partial batches |
+| `queue_depth_threshold` | 32 | 0-4096 | Backlog level triggering batch mode |
 
 ---
 
@@ -164,7 +173,7 @@ struct TunnelHandle {
     tap_fd: RawFd,
 }
 
-// Global demux — RX thread looks up every packet
+// Global demux -- RX thread looks up every packet
 static TUNNEL_MAP: Lazy<DashMap<DemuxKey, TunnelHandle>> = Lazy::new(DashMap::new);
 ```
 
@@ -193,7 +202,7 @@ impl TunnelStats {
     }
 
     fn snapshot(&self) -> StatsSnapshot {
-        // All Relaxed — stats are advisory, not correctness-critical
+        // All Relaxed -- stats are advisory, not correctness-critical
         StatsSnapshot {
             rx_packets: self.rx_packets.load(Ordering::Relaxed),
             rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
@@ -209,14 +218,14 @@ impl TunnelStats {
 
 | Path | Channel | Rationale |
 |------|---------|-----------|
-| RX thread → per-tunnel consumer | `crossbeam::channel::bounded(512)` | RX thread is bare OS thread (not async). Crossbeam works without runtime. |
-| Tunnel consumer → TAP write | Direct `write()` | Consumer owns TAP fd, no channel needed. |
-| TAP read → TX batcher | In-task | Single task owns both sides. |
-| gRPC → TunnelManager | `tokio::sync::mpsc(64)` | Both sides async; integrates with waker system. |
+| RX thread -> per-tunnel consumer | `crossbeam::channel::bounded(512)` | RX thread is bare OS thread (not async). Crossbeam works without runtime. |
+| Tunnel consumer -> TAP write | Direct `write()` | Consumer owns TAP fd, no channel needed. |
+| TAP read -> TX batcher | In-task | Single task owns both sides. |
+| gRPC -> TunnelManager | `tokio::sync::mpsc(64)` | Both sides async; integrates with waker system. |
 
 **Why crossbeam for the hot path:**
 - `tokio::sync::mpsc` requires `.await`, meaning the RX thread would need a tokio context. We avoid this to keep RX free from cooperative scheduling.
-- `crossbeam::Sender::try_send` is wait-free on the fast path. If full, drop packet and increment `rx_errors` — correct backpressure behavior.
+- `crossbeam::Sender::try_send` is wait-free on the fast path. If full, drop packet and increment `rx_errors` -- correct backpressure behavior.
 
 ---
 
@@ -247,18 +256,18 @@ const BUF_TOTAL: usize = HEADER_HEADROOM + MAX_FRAME_SIZE;  // 1586 bytes
 ### Buffer Layout
 
 ```
- ┌──────────────┬────────────────────────────────────┬──────┐
- │  headroom    │         payload (Ethernet frame)    │unused│
- │  (64 bytes)  │         (up to 1522 bytes)         │      │
- └──────────────┴────────────────────────────────────┴──────┘
+ +------------------------------------------------------------------+
+ |  headroom    |         payload (Ethernet frame)    |unused         |
+ |  (64 bytes)  |         (up to 1522 bytes)         |               |
+ +------------------------------------------------------------------+
  ^              ^                                    ^
  data[0]     data[head]                         data[tail]
 
  After header prepend:
- ┌────┬─────────┬────────────────────────────────────┬──────┐
- │free│IP+GRE   │         payload (Ethernet frame)    │unused│
- │    │header   │                                    │      │
- └────┴─────────┴────────────────────────────────────┴──────┘
+ +------------------------------------------------------------------+
+ |free|IP+GRE   |         payload (Ethernet frame)    |unused        |
+ |    |header   |                                    |               |
+ +------------------------------------------------------------------+
        ^        ^                                    ^
     data[head]                                  data[tail]
 ```
@@ -303,8 +312,8 @@ rx_cpu_affinity = [2, 3]  # pin RX threads to these CPUs
 ## 6. io_uring (Future)
 
 Behind feature flag `io_uring`. Replaces:
-- `recvmmsg` → `io_uring` multi-shot receive
-- `sendmmsg` → `io_uring` send SQEs
-- TAP read/write → `io_uring` registered fds
+- `recvmmsg` -> `io_uring` multi-shot receive
+- `sendmmsg` -> `io_uring` send SQEs
+- TAP read/write -> `io_uring` registered fds
 
 Requires kernel >= 5.19 for multi-shot recv. The buffer pool design is already compatible with io_uring's provided-buffer mechanism.

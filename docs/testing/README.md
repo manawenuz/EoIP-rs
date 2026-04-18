@@ -176,3 +176,25 @@ Total:       ~$80
 4. **Captures are archived** — they become regression test data forever
 5. **Rollback on failure** — fix at current phase, don't push forward
 6. **Teardown when idle** — `./teardown-chr.sh --all` to stop billing
+
+## Phase 13: IPsec Secret Testing Notes
+
+**Status:** Complete (2026-04-18)
+
+Test environment: 2x MikroTik CHR 7.18.2 + 1x Linux (Ubuntu, strongSwan) on Hetzner CX23.
+
+### Test Matrix
+
+| Test | Result |
+|------|--------|
+| EoIP-rs (Linux) ↔ MikroTik CHR with `ipsec-secret` | Pass (~230 Mbps) |
+| IKEv1 main mode negotiation (AES-256-CBC/SHA1) | Pass |
+| SA rekeying (Phase 2 every 30min) | Pass, no packet loss |
+| MTU auto-adjustment (1458 -> 1420) | Pass |
+| `print detail` shows `ipsec=yes ipsec-active=yes` | Pass |
+| Tunnel works unencrypted when strongSwan not installed | Pass (graceful fallback) |
+| SA cleanup on tunnel destroy | Pass (no leaked SAs) |
+
+### Key Finding
+
+AF_PACKET RX path is bypassed when IPsec is active -- the kernel's XFRM stack delivers decrypted GRE packets via the raw socket, not the AF_PACKET ring buffer. No special handling required.

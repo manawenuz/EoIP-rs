@@ -35,6 +35,8 @@ Phase 9: Cross-Platform         ─── Windows & macOS ports
 | 7 | [Performance](phase7-performance-stability.md) | 3 | 3-5 days | $45 (P1 license) |
 | 8 | [Linux↔Linux](phase8-linux-to-linux.md) | 2 | 1-2 days | $0 (reuse) |
 | 9 | [Cross-Platform](phase9-cross-platform.md) | varies | 2-4 weeks | $5-20 |
+| 12 | [PMTUD](phase12-pmtud.md) | 2 | 1-2 days | $0 (reuse) |
+| 13 | [IPsec Secret](phase13-ipsec-secret.md) | 3 | 2-3 days | $0 (reuse) | Complete (2026-04-18) |
 
 ## Total Estimated Cost
 

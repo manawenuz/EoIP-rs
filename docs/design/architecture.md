@@ -47,7 +47,19 @@
 |  |  - state tracking  |        |  |    IpAddr),           |  |   |
 |  +--------------------+        |  |    TunnelHandle>      |  |   |
 |                                |  +-----------------------+  |   |
-|                                +-----------------------------+   |
+|                                |                             |   |
+|                                |  +-----------------------+  |   |
+|                                |  | IPsec Manager        |  |   |
+|                                |  |  - VICI client       |  |   |
+|                                |  |  - SA monitor        |  |   |
+|                                |  |  - MTU adjustment    |  |   |
+|                                |  +----------+-----------+  |   |
+|                                +-------------|--------------+   |
+|                                              |                   |
+|  +--------------------+                      | VICI protocol     |
+|  | strongSwan         |<---------------------+                   |
+|  |  (external, IKE)   |                                          |
+|  +--------------------+                                          |
 +------------------------------------------------------------------+
 ```
 
@@ -107,6 +119,11 @@ eoip-rs/
 │           │   ├── fdrecv.rs     # SCM_RIGHTS receive
 │           │   ├── rawsock.rs    # AsyncFd wrappers for raw sockets
 │           │   └── tap.rs        # AsyncFd wrappers for TAP fds
+│           ├── ipsec/
+│           │   ├── mod.rs        # IpsecManager public API
+│           │   ├── vici.rs       # strongSwan VICI protocol client
+│           │   ├── config.rs     # IKE/ESP parameter mapping
+│           │   └── monitor.rs    # SA liveness monitor + re-initiate
 │           ├── api/
 │           │   ├── mod.rs        # gRPC server setup
 │           │   ├── tunnel_svc.rs
@@ -163,7 +180,7 @@ crossbeam = "0.8"
 
 ## 3. Data Flow
 
-### 3.1 TX Path: TAP → Wire
+### 3.1 TX Path: TAP -> Wire
 
 ```
  Ethernet Frame from kernel (bridge/apps)
@@ -187,8 +204,8 @@ crossbeam = "0.8"
  +------------------+
  | Adaptive Batcher |
  |                  |
- |  queue empty:    |──► Immediate sendto()
- |  queue filling:  |──► Accumulate, flush via sendmmsg()
+ |  queue empty:    |---> Immediate sendto()
+ |  queue filling:  |---> Accumulate, flush via sendmmsg()
  +--------+---------+
           |
           v
@@ -197,17 +214,31 @@ crossbeam = "0.8"
  +------------------+
           |
           v
+ +------------------+
+ | Kernel XFRM      |  If IPsec SA active for this peer:
+ | (optional)       |  encrypt GRE -> ESP transport mode
+ +------------------+  (AES-256-CBC/SHA1, 38-byte overhead)
+          |
+          v
       Kernel routes packet to peer
 ```
 
-### 3.2 RX Path: Wire → TAP
+### 3.2 RX Path: Wire -> TAP
 
 ```
- IP packet arrives (proto 47 or 97)
+ IP packet arrives (proto 47/97, or ESP if IPsec active)
+          |
+          v
+ +------------------+
+ | Kernel XFRM      |  If IPsec SA active for this peer:
+ | (optional)       |  decrypt ESP -> GRE transport mode
+ +------------------+  (post-XFRM: raw socket sees plain GRE)
           |
           v
  +------------------+
  | Raw Socket Read  |  recvmmsg() in batch mode
+ |                  |  Note: when IPsec active, PACKET_MMAP/
+ |                  |  AF_PACKET skipped (sees pre-XFRM ESP)
  | (shared socket)  |  Returns payload + source IP
  +--------+---------+
           |
@@ -221,8 +252,8 @@ crossbeam = "0.8"
  +------------------+
  | Demux Lookup     |  DashMap<(tunnel_id, src_ip), TunnelHandle>
  |                  |
- |  Miss → drop     |  Increment unknown_tunnel counter
- |  Hit  → handle   |
+ |  Miss -> drop    |  Increment unknown_tunnel counter
+ |  Hit  -> handle  |
  +--------+---------+
           |
           v
@@ -250,14 +281,14 @@ crossbeam = "0.8"
     (or: daemon connects to well-known socket path)
           |
  4. For each tunnel in config:
-    a. open("/dev/net/tun") → tap_fd
+    a. open("/dev/net/tun") -> tap_fd
     b. ioctl(TUNSETIFF, "eoip%d" | IFF_TAP | IFF_NO_PI)
     c. Send HelperMsg::TapCreated { name, tunnel_id }
        with SCM_RIGHTS carrying tap_fd
           |
  5. Create raw sockets (once per AF):
-    a. socket(AF_INET, SOCK_RAW, 47)  → raw4_fd
-    b. socket(AF_INET6, SOCK_RAW, 97) → raw6_fd
+    a. socket(AF_INET, SOCK_RAW, 47)  -> raw4_fd
+    b. socket(AF_INET6, SOCK_RAW, 97) -> raw6_fd
     c. Send HelperMsg::RawSocket with SCM_RIGHTS
           |
  6. Helper either:
@@ -265,14 +296,21 @@ crossbeam = "0.8"
     b. MODE_EXIT: exits (all tunnels must be in config)
           |
  7. Daemon receives FDs, wraps in AsyncFd, starts processing
+          |
+ 8. For tunnels with ipsec_secret configured:
+    a. Create IpsecManager, connect to strongSwan VICI socket
+    b. Load IKEv1 connection (main mode, AES-256-CBC/SHA1 ESP)
+    c. Initiate SA, adjust tunnel MTU: 1458 -> 1420 (38-byte ESP overhead)
+    d. Spawn SA monitor task (auto-reinitiates on SA loss)
+    e. RX path falls back to raw socket (AF_PACKET/PACKET_MMAP skipped)
 ```
 
-### 4.2 Helper ↔ Daemon Wire Protocol
+### 4.2 Helper <-> Daemon Wire Protocol
 
 Length-prefixed (4 bytes LE) + serde-serialized payload. FDs in `cmsg` ancillary data.
 
 ```rust
-/// Helper → Daemon
+/// Helper -> Daemon
 enum HelperMsg {
     TapCreated { iface_name: String, tunnel_id: u16 },
     RawSocket { address_family: u16 },
@@ -280,12 +318,14 @@ enum HelperMsg {
     HelperReady,
 }
 
-/// Daemon → Helper
+/// Daemon -> Helper
 enum DaemonMsg {
-    CreateTunnel { iface_name: String, tunnel_id: u16 },
+    CreateTunnel { iface_name: String, tunnel_id: u16, mtu: u16, clamp_tcp_mss: bool },
     DestroyTunnel { iface_name: String },
     Shutdown,
 }
+// Note: ipsec_secret is handled daemon-side (VICI to strongSwan),
+// not passed through the helper wire protocol.
 ```
 
 ---
@@ -317,7 +357,7 @@ enum DaemonMsg {
                   ACTIVE)  |  |   STALE      |  Stop TX, keep RX
                            |  +------+------+  (detect recovery)
                            |         |
-                           |  Keepalive resumes → back to ACTIVE
+                           |  Keepalive resumes -> back to ACTIVE
                            |
                     Admin teardown
                            |
@@ -441,6 +481,7 @@ remote = "192.168.1.2"
 iface_name = "eoip-dc1"          # optional, auto if omitted
 mtu = 1500
 enabled = true
+# ipsec_secret = "SecretPass"    # optional: IKEv1 PSK for ESP encryption
 
 [tunnel.keepalive]
 interval = "10s"
@@ -528,34 +569,37 @@ message TunnelEvent {
 
 ```
 tokio runtime (multi-threaded)
-│
-├── [task] gRPC server (tonic)
-│     Holds Arc<TunnelManager>
-│
-├── [task] Helper FD Receiver
-│     Reads from Unix socket, dispatches FDs
-│
-├── [OS thread] RX Worker (proto 47 / IPv4 GRE)
-│     recvmmsg() → parse → demux → channel → TAP write
-│
-├── [OS thread] RX Worker (proto 97 / IPv6 EtherIP)
-│     Same pattern for IPv6
-│
-├── [task per tunnel] TAP Reader
-│     read() → channel → TX Batcher
-│
-├── [task] TX Batcher (proto 47)
-│     Adaptive batching → sendmmsg()
-│
-├── [task] TX Batcher (proto 97)
-│     Same for IPv6
-│
-├── [task] Keepalive Supervisor
-│     Per-tunnel timers, state transitions
-│
-├── [task] Stats Aggregator
-│     Periodic snapshot for logging/export
-│
-└── [task] Signal Handler
-      SIGTERM/SIGINT → CancellationToken → graceful shutdown
+|
++-- [task] gRPC server (tonic)
+|     Holds Arc<TunnelManager>
+|
++-- [task] Helper FD Receiver
+|     Reads from Unix socket, dispatches FDs
+|
++-- [OS thread] RX Worker (proto 47 / IPv4 GRE)
+|     recvmmsg() -> parse -> demux -> channel -> TAP write
+|
++-- [OS thread] RX Worker (proto 97 / IPv6 EtherIP)
+|     Same pattern for IPv6
+|
++-- [task per tunnel] TAP Reader
+|     read() -> channel -> TX Batcher
+|
++-- [task] TX Batcher (proto 47)
+|     Adaptive batching -> sendmmsg()
+|
++-- [task] TX Batcher (proto 97)
+|     Same for IPv6
+|
++-- [task] Keepalive Supervisor
+|     Per-tunnel timers, state transitions
+|
++-- [task] Stats Aggregator
+|     Periodic snapshot for logging/export
+|
++-- [task] IPsec Monitor (per IPsec-enabled tunnel)
+|     Polls SA status via VICI, reinitiates on loss
+|
++-- [task] Signal Handler
+      SIGTERM/SIGINT -> CancellationToken -> graceful shutdown
 ```

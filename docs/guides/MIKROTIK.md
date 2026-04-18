@@ -197,6 +197,52 @@ Both sides should have TCP MSS clamping enabled to prevent TCP sessions from usi
 - **MikroTik:** `Clamp TCP MSS` checkbox (enabled by default)
 - **EoIP-rs:** `clamp_tcp_mss = true` in config (enabled by default)
 
+## IPsec Encryption
+
+EoIP-rs supports MikroTik's `ipsec-secret` parameter for automatic IPsec transport mode encryption. See [IPsec Guide](IPSEC.md) for full setup and troubleshooting.
+
+### MikroTik Side
+
+```routeros
+/interface eoip add name=eoip-linux remote-address=<LINUX_IP> tunnel-id=100 \
+    ipsec-secret=SecretPass allow-fast-path=no
+```
+
+**Important:** `allow-fast-path=no` is required when using `ipsec-secret`.
+
+### EoIP-rs Side
+
+```toml
+[[tunnel]]
+tunnel_id = 100
+local = "<LINUX_IP>"
+remote = "<MIKROTIK_IP>"
+ipsec_secret = "SecretPass"
+```
+
+EoIP-rs uses strongSwan's VICI protocol to create matching IKEv1 SAs automatically. strongSwan must be installed on the Linux host (`apt install strongswan-charon strongswan-swanctl`).
+
+### Verification
+
+```routeros
+# On MikroTik: check IPsec is active
+/interface eoip print detail
+# Should show: ipsec-secret="SecretPass"
+
+/ip ipsec installed-sa print
+# Should show active SAs with enc=aes-cbc key-size=256
+```
+
+```bash
+# On EoIP-rs
+eoip-cli print detail
+# Should show: ipsec=yes ipsec-active=yes
+```
+
+### MTU with IPsec
+
+ESP encryption adds 38 bytes of overhead, reducing the overlay MTU from 1458 to 1420 on a standard 1500-byte path. EoIP-rs adjusts this automatically when `ipsec_secret` is set. See [PMTUD Guide](PMTUD.md) for details.
+
 ## Bridging (L2 Forwarding)
 
 EoIP carries full Ethernet frames, making it ideal for L2 bridges. See [Networking Guide](NETWORKING.md) for detailed bridging and DHCP instructions on Linux and Windows.
