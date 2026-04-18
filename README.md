@@ -226,6 +226,8 @@ Full results: [docs/performance/RESULTS.md](docs/performance/RESULTS.md)
 - **[Installation Guide](docs/guides/INSTALL.md)** — Binary install, compile from source, systemd setup
 - **[MikroTik Setup Guide](docs/guides/MIKROTIK.md)** — Configure MikroTik side for interop
 - **[CLI Guide](docs/guides/CLI.md)** — Full CLI command reference
+- **[PMTUD & Auto-MTU](docs/guides/PMTUD.md)** — Path MTU discovery, auto-detection, TCP MSS clamping
+- **[Networking Guide](docs/guides/NETWORKING.md)** — Bridging, DHCP, routing on Linux and Windows
 - **[Protocol Specification](docs/design/protocol.md)** — Wire format details
 - **[Architecture](docs/design/architecture.md)** — System design and crate structure
 - **[Performance Results](docs/performance/RESULTS.md)** — Benchmark data

@@ -137,9 +137,69 @@ keepalive_interval_secs = 5
 keepalive_timeout_secs = 25
 ```
 
+## MTU & Path MTU Discovery
+
+EoIP-rs auto-detects the overlay MTU, matching MikroTik's behavior. See [PMTUD Guide](PMTUD.md) for full details.
+
+### MikroTik MTU Fields
+
+| Field | Meaning |
+|-------|---------|
+| **MTU** | Configured value (blank = auto) |
+| **Actual MTU** | Discovered overlay MTU (path MTU - 42 bytes overhead) |
+| **L2 MTU** | Max L2 frame size (always 65535 for EoIP — virtual, no hardware limit) |
+
+### Matching Configuration
+
+Both sides should agree on the overlay MTU. With auto-detection on both sides, this happens automatically:
+
+```routeros
+# MikroTik: leave MTU blank (auto)
+/interface eoip add name=eoip-linux remote-address=<LINUX_IP> tunnel-id=100
+# Check: /interface eoip print detail
+#   actual-mtu=1458 (for 1500-byte path)
+#   actual-mtu=1378 (for WireGuard path)
+```
+
+```toml
+# EoIP-rs: omit mtu or set to "auto"
+[[tunnel]]
+tunnel_id = 100
+remote = "<MIKROTIK_IP>"
+# mtu = "auto"   (default)
+```
+
+### Verifying MTU Match
+
+```routeros
+# On MikroTik: test with DF flag
+/ping <overlay_ip> do-not-fragment size=1430
+# Should succeed (fits in 1458)
+
+/ping <overlay_ip> do-not-fragment size=1500
+# Should fail: "packet too large and cannot be fragmented"
+```
+
+```bash
+# On Linux: same test
+ping -M do -s 1430 <overlay_ip>    # should work
+ping -M do -s 1472 <overlay_ip>    # should fail (> 1458 - 28)
+```
+
+### Key Differences
+
+MikroTik sets L2 MTU to 65535 and IP-fragments oversized outer GRE packets (when `Dont Fragment = no`). EoIP-rs sets the TAP interface MTU to the actual overlay MTU so the kernel enforces the limit — no IP fragmentation occurs. Both approaches are interoperable; the difference is only in how each side handles locally-originated oversized frames.
+
+### TCP MSS Clamping
+
+Both sides should have TCP MSS clamping enabled to prevent TCP sessions from using segments that would require fragmentation:
+
+- **MikroTik:** `Clamp TCP MSS` checkbox (enabled by default)
+- **EoIP-rs:** `clamp_tcp_mss = true` in config (enabled by default)
+
 ## Bridging (L2 Forwarding)
 
-EoIP carries full Ethernet frames, making it ideal for L2 bridges:
+EoIP carries full Ethernet frames, making it ideal for L2 bridges. See [Networking Guide](NETWORKING.md) for detailed bridging and DHCP instructions on Linux and Windows.
 
 ### MikroTik
 
@@ -156,6 +216,25 @@ sudo ip link add br-eoip type bridge
 sudo ip link set eoip100 master br-eoip
 sudo ip link set eth1 master br-eoip
 sudo ip link set br-eoip up
+```
+
+### Windows
+
+Open **Network Connections**, select both the EoIP TAP adapter and the physical NIC, right-click and choose **Bridge Connections**.
+
+### DHCP Through the Tunnel
+
+If MikroTik has a DHCP server on the bridged network, remote devices can get IPs through the EoIP tunnel:
+
+```bash
+# Linux: request DHCP on the tunnel interface
+sudo dhclient eoip100
+```
+
+```powershell
+# Windows: set adapter to DHCP
+Set-NetIPInterface -InterfaceAlias "EoIP Tunnel" -Dhcp Enabled
+ipconfig /renew "EoIP Tunnel"
 ```
 
 ## Troubleshooting
