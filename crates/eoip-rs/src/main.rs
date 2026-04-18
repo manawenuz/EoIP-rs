@@ -200,7 +200,7 @@ async fn run(args: Args) -> Result<(), DaemonError> {
                 tx_sender.clone(), tunnel_cancel.clone(),
             );
 
-            // TAP writer — dedicated OS thread for zero-overhead channel → TAP delivery
+            // TAP writer — dedicated OS thread, batch-drains channel to reduce contention
             if let Some(ref rx_recv) = handle.rx_receiver {
                 let tap_fd = tap.as_fd().as_raw_fd();
                 let rx = rx_recv.clone();
@@ -208,9 +208,21 @@ async fn run(args: Args) -> Result<(), DaemonError> {
                 std::thread::Builder::new()
                     .name(format!("tap-wr-{tid}"))
                     .spawn(move || {
+                        const MAX_BATCH: usize = 32;
+                        let mut bufs = Vec::with_capacity(MAX_BATCH);
+
                         while let Ok(buf) = rx.recv() {
-                            let data = buf.as_slice();
-                            unsafe { libc::write(tap_fd, data.as_ptr() as *const _, data.len()) };
+                            bufs.push(buf);
+                            while bufs.len() < MAX_BATCH {
+                                match rx.try_recv() {
+                                    Ok(b) => bufs.push(b),
+                                    Err(_) => break,
+                                }
+                            }
+                            for b in bufs.drain(..) {
+                                let data = b.as_slice();
+                                unsafe { libc::write(tap_fd, data.as_ptr() as *const _, data.len()) };
+                            }
                         }
                     })
                     .expect("failed to spawn TAP writer thread");
