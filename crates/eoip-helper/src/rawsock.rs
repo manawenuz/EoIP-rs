@@ -82,3 +82,110 @@ pub fn create_raw_socket_v6() -> Result<OwnedFd, EoipError> {
     tracing::info!("created raw socket: AF_INET6, SOCK_RAW, proto=97 (EtherIP), hops=255, bufs=4MB");
     Ok(OwnedFd::from(sock))
 }
+
+/// Create an AF_PACKET socket for zero-copy RX via PACKET_MMAP (TPACKET_V3).
+///
+/// Uses `SOCK_RAW` + `ETH_P_IP` to receive full Ethernet frames. A BPF filter
+/// restricts to inbound GRE packets only (IP protocol 47 at offset 23).
+/// `PACKET_IGNORE_OUTGOING` prevents own TX from flooding the ring buffer.
+///
+/// Note: offset 23 assumes standard 14-byte Ethernet (no VLAN tags).
+#[cfg(target_os = "linux")]
+pub fn create_af_packet_socket_v4() -> Result<OwnedFd, EoipError> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            (libc::ETH_P_IP as u16).to_be() as i32,
+        )
+    };
+    if fd < 0 {
+        return Err(EoipError::RawSocketError(std::io::Error::last_os_error()));
+    }
+
+    let sock_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let raw_fd = {
+        use std::os::fd::AsRawFd;
+        sock_fd.as_raw_fd()
+    };
+
+    // Drop outgoing packets (PACKET_IGNORE_OUTGOING, Linux 4.20+).
+    // Without this, our own GRE TX floods the ring buffer under load.
+    const SOL_PACKET: libc::c_int = 263;
+    const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
+    let ignore_out: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            raw_fd,
+            SOL_PACKET,
+            PACKET_IGNORE_OUTGOING,
+            &ignore_out as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&ignore_out) as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        tracing::warn!("PACKET_IGNORE_OUTGOING not available, outgoing packets may flood ring");
+    }
+
+    // BPF filter: accept GRE (proto 47) and IP fragments of GRE packets.
+    // With SOCK_RAW on AF_PACKET, BPF sees full L2 frame.
+    // Offset 23 = 14 (ETH) + 9 (IP protocol field).
+    // Offset 20 = 14 (ETH) + 6 (IP frag offset field, 2 bytes).
+    //
+    // GRE-encapsulated 1500-byte frames exceed MTU → IP fragmentation.
+    // Only the first fragment has the GRE header; subsequent fragments
+    // have fragment offset > 0 and no GRE header. Must accept both.
+    //
+    //   0: LDB  [23]             ; load IP protocol byte
+    //   1: JEQ  #47, 4, 0        ; if GRE → accept
+    //   2: LDH  [20]             ; load IP flags+frag_offset (2 bytes)
+    //   3: JSET #0x1FFF, 0, 1    ; if frag_offset != 0 → accept (continuation fragment)
+    //   4: RET  #0               ; drop (not GRE, not a fragment)
+    //   5: RET  #0xFFFF          ; accept
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+
+    let filter: [SockFilter; 6] = [
+        SockFilter { code: 0x30, jt: 0, jf: 0, k: 23 },        // LDB [23]
+        SockFilter { code: 0x15, jt: 3, jf: 0, k: 47 },        // JEQ #47 → accept (skip 3)
+        SockFilter { code: 0x28, jt: 0, jf: 0, k: 20 },        // LDH [20] (flags+frag_offset)
+        SockFilter { code: 0x45, jt: 1, jf: 0, k: 0x1FFF },    // JSET #0x1FFF → accept (frag)
+        SockFilter { code: 0x06, jt: 0, jf: 0, k: 0 },         // RET drop
+        SockFilter { code: 0x06, jt: 0, jf: 0, k: 0xFFFF },    // RET accept
+    ];
+
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const SockFilter,
+    }
+
+    let prog = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+
+    let ret = unsafe {
+        libc::setsockopt(
+            raw_fd,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            &prog as *const _ as *const libc::c_void,
+            std::mem::size_of::<SockFprog>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(EoipError::RawSocketError(std::io::Error::last_os_error()));
+    }
+
+    tracing::info!("created AF_PACKET socket: SOCK_RAW, ETH_P_IP, BPF=GRE-only, IGNORE_OUTGOING");
+    Ok(sock_fd)
+}

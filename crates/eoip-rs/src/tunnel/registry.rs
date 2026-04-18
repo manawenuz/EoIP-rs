@@ -97,10 +97,11 @@ mod tests {
             local: "10.0.0.1".parse().unwrap(),
             remote: "10.0.0.2".parse().unwrap(),
             iface_name: None,
-            mtu: 1500,
+            mtu: crate::config::MtuConfig::Fixed(1500),
             enabled: true,
             keepalive_interval_secs: 10,
             keepalive_timeout_secs: 30,
+            clamp_tcp_mss: true,
         }))
     }
 

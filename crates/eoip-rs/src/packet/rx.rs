@@ -36,9 +36,13 @@ const RECV_BATCH: usize = 32;
 const RECV_BUF_SIZE: usize = 2048;
 
 /// Start the RX pipeline: spawn dedicated OS threads for v4 and v6 raw sockets.
+///
+/// If `af_packet_v4` is provided, uses AF_PACKET socket for IPv4 RX instead
+/// of the raw GRE socket. This enables PACKET_MMAP zero-copy RX.
 pub fn start_rx_pipeline(
     raw_v4: Option<BorrowedFd<'_>>,
     raw_v6: Option<BorrowedFd<'_>>,
+    af_packet_v4: Option<BorrowedFd<'_>>,
     registry: Arc<TunnelRegistry>,
     pool: Arc<BufferPool>,
     shutdown: CancellationToken,
@@ -46,9 +50,32 @@ pub fn start_rx_pipeline(
 ) -> RxPipelineHandle {
     let rx_workers = rx_workers.max(1);
 
-    // Spawn multiple v4 workers for parallelism
-    // Each reads from the same fd — the kernel distributes packets
-    let v4_threads = if let Some(fd) = raw_v4 {
+    // IPv4 RX: prefer PACKET_MMAP ring → AF_PACKET recvmmsg → raw socket recvmmsg
+    let v4_threads = if let Some(af_fd) = af_packet_v4 {
+        // AF_PACKET path — single worker, try ring first, fall back to recvmmsg
+        let raw_fd = af_fd.as_raw_fd();
+        let registry = Arc::clone(&registry);
+        let pool = Arc::clone(&pool);
+        let shutdown = shutdown.clone();
+        vec![
+            std::thread::Builder::new()
+                .name("rx-v4-afp".into())
+                .spawn(move || {
+                    // Try PACKET_MMAP ring first
+                    #[cfg(target_os = "linux")]
+                    {
+                        rx_loop_v4_mmap(raw_fd, &registry, &pool, &shutdown);
+                        // If mmap returned (error or shutdown), we're done
+                        return;
+                    }
+                    // Non-linux fallback: AF_PACKET recvmmsg
+                    #[cfg(not(target_os = "linux"))]
+                    rx_loop_v4_afpacket(raw_fd, &registry, &pool, &shutdown);
+                })
+                .expect("failed to spawn RX AF_PACKET thread"),
+        ]
+    } else if let Some(fd) = raw_v4 {
+        // Fallback: raw socket recvmmsg with N workers
         let raw_fd = fd.as_raw_fd();
         (0..rx_workers)
             .map(|i| {
@@ -329,6 +356,123 @@ fn try_rx_loop_recvmmsg(
     }
 
     true
+}
+
+/// EoIP (IPv4) receive loop using AF_PACKET socket.
+///
+/// Currently uses recvmmsg on the AF_PACKET socket to validate the socket
+/// + BPF filter under load. The ring-based path (rx_loop_v4_mmap) will
+/// replace this once validated.
+///
+/// AF_PACKET SOCK_RAW delivers full Ethernet frames. We strip the 14-byte
+/// L2 header to get IP data for process_v4_packet().
+#[cfg(target_os = "linux")]
+fn rx_loop_v4_afpacket(
+    raw_fd: std::os::fd::RawFd,
+    registry: &TunnelRegistry,
+    pool: &BufferPool,
+    shutdown: &CancellationToken,
+) {
+    const ETH_HLEN: usize = 14;
+
+    tracing::info!("RX v4 AF_PACKET worker started (recvmmsg validation)");
+
+    let mut bufs: Vec<Vec<u8>> = (0..RECV_BATCH).map(|_| vec![0u8; RECV_BUF_SIZE]).collect();
+    let mut iovs: Vec<libc::iovec> = bufs
+        .iter_mut()
+        .map(|buf| libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut _,
+            iov_len: buf.len(),
+        })
+        .collect();
+
+    let mut msg_hdrs: Vec<libc::mmsghdr> = iovs
+        .iter_mut()
+        .map(|iov| {
+            let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            hdr.msg_hdr.msg_iov = iov as *mut _;
+            hdr.msg_hdr.msg_iovlen = 1;
+            hdr
+        })
+        .collect();
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        let timeout = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+        let count = unsafe {
+            libc::recvmmsg(
+                raw_fd,
+                msg_hdrs.as_mut_ptr(),
+                RECV_BATCH as u32,
+                libc::MSG_WAITFORONE,
+                &timeout as *const _ as *mut _,
+            )
+        };
+
+        if count < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted
+                || err.kind() == std::io::ErrorKind::WouldBlock
+            {
+                continue;
+            }
+            if !shutdown.is_cancelled() {
+                tracing::error!(%err, "AF_PACKET recvmmsg error");
+            }
+            break;
+        }
+
+        for i in 0..count as usize {
+            let n = msg_hdrs[i].msg_len as usize;
+            // AF_PACKET SOCK_RAW: first 14 bytes are Ethernet header, skip them
+            if n <= ETH_HLEN {
+                continue;
+            }
+            process_v4_packet(&bufs[i][ETH_HLEN..], n - ETH_HLEN, registry, pool);
+        }
+    }
+
+    tracing::info!("RX v4 AF_PACKET worker stopped");
+}
+
+/// EoIP (IPv4) receive loop using AF_PACKET + TPACKET_V3 ring buffer.
+///
+/// Zero-copy path: kernel writes packets directly into mmap'd ring buffer.
+/// We process blocks in-place, calling `process_v4_packet()` with IP data
+/// from `tp_net` offset (L2 header already skipped by the ring abstraction).
+#[cfg(target_os = "linux")]
+fn rx_loop_v4_mmap(
+    af_packet_fd: std::os::fd::RawFd,
+    registry: &TunnelRegistry,
+    pool: &BufferPool,
+    shutdown: &CancellationToken,
+) {
+    use crate::packet::packet_mmap::PacketMmapRing;
+
+    let mut ring = match PacketMmapRing::new(af_packet_fd) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "failed to set up PACKET_MMAP ring");
+            return;
+        }
+    };
+
+    tracing::info!("RX v4 PACKET_MMAP worker started");
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        ring.process_block(1000, |data, data_len| {
+            process_v4_packet(data, data_len, registry, pool);
+        });
+    }
+
+    tracing::info!("RX v4 PACKET_MMAP worker stopped");
 }
 
 /// EoIPv6 (IPv6, protocol 97) receive loop.

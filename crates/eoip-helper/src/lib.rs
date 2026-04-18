@@ -5,6 +5,7 @@
 //! domain socket. Audit surface: ~200 lines of privileged code.
 
 pub mod fdpass;
+pub mod mss;
 pub mod privdrop;
 pub mod rawsock;
 pub mod tap;

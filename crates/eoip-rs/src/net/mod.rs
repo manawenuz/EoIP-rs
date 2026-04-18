@@ -1,5 +1,7 @@
-//! Network I/O: TAP device wrapper and helper communication.
+//! Network I/O: TAP device wrapper, MTU detection, and helper communication.
 
+pub mod mtu;
+pub mod pmtud;
 #[cfg(unix)]
 pub mod tap;
 #[cfg(target_os = "windows")]

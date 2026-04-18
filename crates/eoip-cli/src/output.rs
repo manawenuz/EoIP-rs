@@ -40,15 +40,15 @@ pub fn print_table(tunnels: &[Tunnel]) {
 
     println!("{}", "Flags: X - disabled; R - running; S - stale; I - initializing");
     println!(
-        "{:>2} {:1} {:<15} {:>10}   {:<15}  {:<15}  {:>5}",
-        "#", "", "NAME", "TUNNEL-ID", "LOCAL-ADDR", "REMOTE-ADDR", "MTU"
+        "{:>2} {:1} {:<15} {:>10}   {:<15}  {:<15}  {:>5}  {:>10}",
+        "#", "", "NAME", "TUNNEL-ID", "LOCAL-ADDR", "REMOTE-ADDR", "MTU", "ACTUAL-MTU"
     );
 
     for (i, t) in tunnels.iter().enumerate() {
         let (_, flag) = state_flag(t);
         println!(
-            "{:>2} {} {:<15} {:>10}   {:<15}  {:<15}  {:>5}",
-            i, flag, t.iface_name, t.tunnel_id, t.local_addr, t.remote_addr, t.mtu
+            "{:>2} {} {:<15} {:>10}   {:<15}  {:<15}  {:>5}  {:>10}",
+            i, flag, t.iface_name, t.tunnel_id, t.local_addr, t.remote_addr, t.mtu, t.actual_mtu
         );
     }
 }
@@ -69,8 +69,8 @@ pub fn print_detail(tunnels: &[Tunnel]) {
             i, flag, t.iface_name, t.tunnel_id, t.local_addr
         );
         println!(
-            "      remote-address={} mtu={} keepalive={}s,{}s",
-            t.remote_addr, t.mtu, t.keepalive_interval_secs, t.keepalive_timeout_secs
+            "      remote-address={} mtu={} actual-mtu={} keepalive={}s,{}s",
+            t.remote_addr, t.mtu, t.actual_mtu, t.keepalive_interval_secs, t.keepalive_timeout_secs
         );
         println!(
             "      enabled={} state={}",

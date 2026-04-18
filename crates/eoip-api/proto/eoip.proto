@@ -14,6 +14,7 @@ message Tunnel {
   TunnelState state = 7;
   uint32 keepalive_interval_secs = 8;
   uint32 keepalive_timeout_secs = 9;
+  uint32 actual_mtu = 10;
 }
 
 enum TunnelState {

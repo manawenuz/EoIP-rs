@@ -191,6 +191,32 @@ impl WinTapDevice {
     }
 }
 
+    /// Set the MTU on this TAP adapter via `netsh`.
+    ///
+    /// Requires the adapter to have an assigned name (connection name in
+    /// Windows Network Connections). The `adapter_name` is the human-readable
+    /// name (e.g. "Local Area Connection 2"), not the GUID.
+    pub fn set_mtu(adapter_name: &str, mtu: u16) -> io::Result<()> {
+        let output = std::process::Command::new("netsh")
+            .args([
+                "interface", "ipv4", "set", "subinterface",
+                adapter_name,
+                &format!("mtu={mtu}"),
+                "store=persistent",
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("netsh set mtu failed: {stderr}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Drop for WinTapDevice {
     fn drop(&mut self) {
         let _ = self.set_media_status(false);

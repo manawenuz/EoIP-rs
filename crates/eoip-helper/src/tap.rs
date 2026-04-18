@@ -81,11 +81,63 @@ pub fn create_tap_interface(name: &str) -> Result<OwnedFd, EoipError> {
     })
 }
 
+/// Set the MTU on an existing network interface.
+///
+/// Requires `CAP_NET_ADMIN` or root.
+#[cfg(target_os = "linux")]
+pub fn set_interface_mtu(name: &str, mtu: u16) -> Result<(), EoipError> {
+    if name.is_empty() || name.len() >= IFNAMSIZ {
+        return Err(EoipError::TapError {
+            iface: name.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("interface name must be 1-{} chars", IFNAMSIZ - 1),
+            ),
+        });
+    }
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if sock < 0 {
+        return Err(EoipError::TapError {
+            iface: name.to_string(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    let _guard = unsafe { std::os::fd::OwnedFd::from_raw_fd(sock) };
+
+    let mut ifr = Ifreq::new();
+    let name_bytes = name.as_bytes();
+    ifr.ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
+    ifr.ifr_ifru.ifr_mtu = mtu as i32;
+
+    let ret = unsafe { libc::ioctl(sock, SIOCSIFMTU, &ifr) };
+    if ret < 0 {
+        return Err(EoipError::TapError {
+            iface: name.to_string(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+
+    tracing::info!(interface = %name, mtu = mtu, "set interface MTU");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_interface_mtu(name: &str, mtu: u16) -> Result<(), EoipError> {
+    tracing::debug!(interface = %name, mtu = mtu, "set_interface_mtu is a no-op on this platform");
+    let _ = (name, mtu);
+    Ok(())
+}
+
 // ── Linux ifreq / ioctl definitions ──────────────────────────────
 
 /// `TUNSETIFF` ioctl request code.
 #[cfg(target_os = "linux")]
 const TUNSETIFF: libc::c_ulong = 0x400454CA;
+
+/// `SIOCSIFMTU` ioctl request code (set interface MTU).
+#[cfg(target_os = "linux")]
+const SIOCSIFMTU: libc::c_ulong = 0x8922;
 
 /// Minimal `ifreq` struct matching the Linux kernel layout.
 #[cfg(target_os = "linux")]
@@ -99,6 +151,7 @@ struct Ifreq {
 #[repr(C)]
 union IfrIfru {
     ifr_flags: i16,
+    ifr_mtu: i32,
     _padding: [u8; 24],
 }
 

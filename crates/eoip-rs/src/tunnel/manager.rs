@@ -71,6 +71,17 @@ impl TunnelManager {
 
     /// Create a tunnel dynamically: request TAP from helper, spawn tasks, register.
     pub async fn create_tunnel(&self, config: TunnelConfig) -> Result<(), String> {
+        // Resolve MTU: auto-detect or use explicit config value.
+        let resolved_mtu = config.mtu.resolve(config.remote);
+        if config.mtu.is_auto() {
+            tracing::info!(
+                tunnel_id = config.tunnel_id,
+                remote = %config.remote,
+                overlay_mtu = resolved_mtu,
+                "auto-detected overlay MTU"
+            );
+        }
+
         let tunnel_id = config.tunnel_id;
         let iface_name = config.effective_iface_name();
 
@@ -81,6 +92,7 @@ impl TunnelManager {
 
         // Create handle and register (Initializing state)
         let handle = Arc::new(TunnelHandle::new(config.clone()));
+        handle.actual_mtu.store(resolved_mtu, std::sync::atomic::Ordering::Relaxed);
         let key = DemuxKey {
             tunnel_id,
             peer_addr: config.remote,
@@ -96,6 +108,8 @@ impl TunnelManager {
             let create_msg = DaemonMsg::CreateTunnel {
                 iface_name: iface_name.clone(),
                 tunnel_id,
+                mtu: resolved_mtu,
+                clamp_tcp_mss: config.clamp_tcp_mss,
             };
             let payload = eoip_proto::wire::serialize_msg(&create_msg)
                 .map_err(|e| format!("serialize: {e}"))?;
@@ -210,6 +224,15 @@ impl TunnelManager {
             raw_fd,
             tunnel_cancel.clone(),
         );
+
+        // Spawn PMTUD task (auto-detect only — skip for explicit MTU).
+        if config.mtu.is_auto() {
+            crate::net::pmtud::spawn_pmtud_task(
+                Arc::clone(&handle),
+                config.remote,
+                tunnel_cancel.clone(),
+            );
+        }
 
         // Track tasks
         self.tasks.lock().unwrap().insert(tunnel_id, TunnelTasks {

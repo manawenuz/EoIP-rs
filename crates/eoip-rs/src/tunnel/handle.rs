@@ -1,5 +1,6 @@
 //! Tunnel handle — the per-tunnel runtime state held in the registry.
 
+use std::sync::atomic::AtomicU16;
 use std::sync::Arc;
 
 use eoip_proto::TunnelStats;
@@ -19,6 +20,8 @@ pub struct TunnelHandle {
     pub config: TunnelConfig,
     pub state: AtomicTunnelState,
     pub stats: Arc<TunnelStats>,
+    /// Runtime-resolved overlay MTU (from auto-detection or PMTUD).
+    pub actual_mtu: AtomicU16,
     #[cfg(unix)]
     pub tap_fd: Option<std::os::fd::OwnedFd>,
     #[cfg(unix)]
@@ -43,6 +46,7 @@ impl TunnelHandle {
             config,
             state: AtomicTunnelState::new(TunnelState::Initializing),
             stats: Arc::new(TunnelStats::new()),
+            actual_mtu: AtomicU16::new(0),
             #[cfg(unix)]
             tap_fd: None,
             #[cfg(unix)]
