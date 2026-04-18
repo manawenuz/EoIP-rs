@@ -19,6 +19,20 @@ use eoip_proto::DemuxKey;
 use crate::packet::buffer::{BufferPool, PacketBuf, MAX_FRAME_SIZE};
 use crate::tunnel::registry::TunnelRegistry;
 
+/// Poll a file descriptor for readability with a 1-second timeout.
+///
+/// Returns `true` if the fd is readable, `false` on timeout or error.
+/// Prevents busy-loops on non-blocking sockets by blocking in `poll()`.
+fn poll_readable(fd: std::os::fd::RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 1000) }; // 1s timeout
+    ret > 0 && (pfd.revents & libc::POLLIN) != 0
+}
+
 /// Handle for a running RX pipeline.
 pub struct RxPipelineHandle {
     pub v4_threads: Vec<std::thread::JoinHandle<()>>,
@@ -275,7 +289,7 @@ fn rx_loop_v4(
         return;
     }
 
-    // Fallback: blocking read loop (no sleep, fd should be blocking)
+    // Fallback: read loop with poll — fd is non-blocking, must poll before read
     let mut recv_buf = vec![0u8; RECV_BUF_SIZE];
     loop {
         if shutdown.is_cancelled() {
@@ -284,7 +298,10 @@ fn rx_loop_v4(
 
         let n = match nix::unistd::read(raw_fd, &mut recv_buf) {
             Ok(n) => n,
-            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {
+                poll_readable(raw_fd);
+                continue;
+            }
             Err(e) => {
                 if !shutdown.is_cancelled() {
                     tracing::error!(%e, "RX v4 read error");
@@ -373,6 +390,7 @@ fn try_rx_loop_recvmmsg(
                 continue;
             }
             if err.kind() == std::io::ErrorKind::WouldBlock {
+                poll_readable(raw_fd);
                 continue;
             }
             if !shutdown.is_cancelled() {
@@ -447,9 +465,11 @@ fn rx_loop_v4_afpacket(
 
         if count < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted
-                || err.kind() == std::io::ErrorKind::WouldBlock
-            {
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                poll_readable(raw_fd);
                 continue;
             }
             if !shutdown.is_cancelled() {
@@ -662,9 +682,11 @@ fn try_rx_loop_v6_recvmmsg(
 
         if count < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted
-                || err.kind() == std::io::ErrorKind::WouldBlock
-            {
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                poll_readable(raw_fd);
                 continue;
             }
             if !shutdown.is_cancelled() {
@@ -715,7 +737,11 @@ fn rx_loop_v6_recvfrom(
         if n < 0 {
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => {
+                    poll_readable(raw_fd);
+                    continue;
+                }
+                Some(libc::EINTR) => continue,
                 _ => {
                     if !shutdown.is_cancelled() {
                         tracing::error!(%err, "RX v6 recvfrom error");
