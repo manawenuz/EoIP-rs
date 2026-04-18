@@ -31,6 +31,10 @@ pub type TunnelRxSender = Sender<PacketBuf>;
 /// Batch size for recvmmsg.
 const RECV_BATCH: usize = 32;
 
+/// Per-buffer size for recvmmsg. Max EoIP frame = 20 (IP) + 8 (GRE) + 1500 (MTU) + 14 (ETH) + 4 (VLAN) = 1546.
+/// Round up to 2048 for alignment. Was 65536 — 42x oversized, wasting cache.
+const RECV_BUF_SIZE: usize = 2048;
+
 /// Start the RX pipeline: spawn dedicated OS threads for v4 and v6 raw sockets.
 pub fn start_rx_pipeline(
     raw_v4: Option<BorrowedFd<'_>>,
@@ -38,12 +42,15 @@ pub fn start_rx_pipeline(
     registry: Arc<TunnelRegistry>,
     pool: Arc<BufferPool>,
     shutdown: CancellationToken,
+    rx_workers: usize,
 ) -> RxPipelineHandle {
+    let rx_workers = rx_workers.max(1);
+
     // Spawn multiple v4 workers for parallelism
     // Each reads from the same fd — the kernel distributes packets
     let v4_threads = if let Some(fd) = raw_v4 {
         let raw_fd = fd.as_raw_fd();
-        (0..2)
+        (0..rx_workers)
             .map(|i| {
                 let registry = Arc::clone(&registry);
                 let pool = Arc::clone(&pool);
@@ -96,20 +103,31 @@ fn log_demux_miss(key: &DemuxKey) {
     }
 }
 
-/// Get coarse timestamp (ms since epoch). Caches to avoid syscall on every packet.
+/// Get coarse timestamp (ms since epoch) via CLOCK_REALTIME_COARSE (vDSO, ~4ns).
+/// Refreshes every 64 packets to amortize even the vDSO cost.
 #[inline(always)]
 fn coarse_timestamp_ms() -> i64 {
-    // Use CLOCK_MONOTONIC_COARSE via a thread-local cache that refreshes every ~50 packets
     thread_local! {
         static CACHED: std::cell::Cell<(u64, i64)> = const { std::cell::Cell::new((0, 0)) };
     }
     CACHED.with(|c| {
         let (count, ts) = c.get();
         if count % 64 == 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
+            let now = {
+                #[cfg(target_os = "linux")]
+                {
+                    let mut tp = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut tp) };
+                    tp.tv_sec as i64 * 1000 + tp.tv_nsec as i64 / 1_000_000
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0)
+                }
+            };
             c.set((count + 1, now));
             now
         } else {
@@ -147,13 +165,14 @@ fn process_v4_packet(
 
     let key = DemuxKey { tunnel_id, peer_addr: src_ip };
 
-    let handle = match registry.get(&key) {
-        Some(h) => h,
+    let guard = match registry.get_ref(&key) {
+        Some(g) => g,
         None => {
             log_demux_miss(&key);
             return;
         }
     };
+    let handle = guard.value();
 
     let frame_data = &eoip_data[hdr_len..];
 
@@ -197,7 +216,7 @@ fn rx_loop_v4(
     }
 
     // Fallback: blocking read loop (no sleep, fd should be blocking)
-    let mut recv_buf = vec![0u8; 65536];
+    let mut recv_buf = vec![0u8; RECV_BUF_SIZE];
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -230,7 +249,7 @@ fn try_rx_loop_recvmmsg(
     shutdown: &CancellationToken,
 ) -> bool {
     // Allocate batch buffers
-    let mut bufs: Vec<Vec<u8>> = (0..RECV_BATCH).map(|_| vec![0u8; 65536]).collect();
+    let mut bufs: Vec<Vec<u8>> = (0..RECV_BATCH).map(|_| vec![0u8; RECV_BUF_SIZE]).collect();
     let mut iovs: Vec<libc::iovec> = bufs
         .iter_mut()
         .map(|buf| libc::iovec {
@@ -324,7 +343,7 @@ fn rx_loop_v6(
     shutdown: &CancellationToken,
 ) {
     tracing::info!("RX v6 worker started");
-    let mut recv_buf = vec![0u8; 65536];
+    let mut recv_buf = vec![0u8; RECV_BUF_SIZE];
     let mut sockaddr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
 
     loop {
@@ -374,13 +393,14 @@ fn rx_loop_v6(
             peer_addr: src_ip,
         };
 
-        let handle = match registry.get(&key) {
-            Some(h) => h,
+        let guard = match registry.get_ref(&key) {
+            Some(g) => g,
             None => {
                 log_demux_miss(&key);
                 continue;
             }
         };
+        let handle = guard.value();
 
         let frame_data = &recv_buf[hdr_len..n];
         let is_keepalive = frame_data.is_empty();
