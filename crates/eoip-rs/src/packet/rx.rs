@@ -50,9 +50,9 @@ pub fn start_rx_pipeline(
 ) -> RxPipelineHandle {
     let rx_workers = rx_workers.max(1);
 
-    // IPv4 RX: prefer AF_PACKET path (zero-copy), fall back to raw socket recvmmsg
+    // IPv4 RX: prefer PACKET_MMAP ring → AF_PACKET recvmmsg → raw socket recvmmsg
     let v4_threads = if let Some(af_fd) = af_packet_v4 {
-        // AF_PACKET path — single worker (ring processes blocks atomically)
+        // AF_PACKET path — single worker, try ring first, fall back to recvmmsg
         let raw_fd = af_fd.as_raw_fd();
         let registry = Arc::clone(&registry);
         let pool = Arc::clone(&pool);
@@ -60,7 +60,18 @@ pub fn start_rx_pipeline(
         vec![
             std::thread::Builder::new()
                 .name("rx-v4-afp".into())
-                .spawn(move || rx_loop_v4_afpacket(raw_fd, &registry, &pool, &shutdown))
+                .spawn(move || {
+                    // Try PACKET_MMAP ring first
+                    #[cfg(target_os = "linux")]
+                    {
+                        rx_loop_v4_mmap(raw_fd, &registry, &pool, &shutdown);
+                        // If mmap returned (error or shutdown), we're done
+                        return;
+                    }
+                    // Non-linux fallback: AF_PACKET recvmmsg
+                    #[cfg(not(target_os = "linux"))]
+                    rx_loop_v4_afpacket(raw_fd, &registry, &pool, &shutdown);
+                })
                 .expect("failed to spawn RX AF_PACKET thread"),
         ]
     } else if let Some(fd) = raw_v4 {
@@ -433,7 +444,6 @@ fn rx_loop_v4_afpacket(
 /// We process blocks in-place, calling `process_v4_packet()` with IP data
 /// from `tp_net` offset (L2 header already skipped by the ring abstraction).
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 fn rx_loop_v4_mmap(
     af_packet_fd: std::os::fd::RawFd,
     registry: &TunnelRegistry,
