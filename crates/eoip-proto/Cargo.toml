@@ -7,7 +7,6 @@ rust-version.workspace = true
 description = "Pure Rust MikroTik EoIP/EoIPv6 protocol codecs — no async, no I/O"
 
 [dependencies]
-bytes.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }

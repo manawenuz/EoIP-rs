@@ -76,8 +76,8 @@ pub fn decode_eoip_header(buf: &[u8]) -> Result<(u16, u16, usize), EoipError> {
 
     if buf[0..4] != EOIP_MAGIC {
         return Err(EoipError::InvalidMagicBytes {
-            expected: EOIP_MAGIC.to_vec(),
-            got: buf[0..4].to_vec(),
+            expected: &EOIP_MAGIC,
+            got: [buf[0], buf[1], buf[2], buf[3]],
         });
     }
 

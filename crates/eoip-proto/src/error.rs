@@ -41,7 +41,7 @@ pub enum EoipError {
     ConfigError(String),
 
     #[error("invalid magic bytes: expected {expected:02x?}, got {got:02x?}")]
-    InvalidMagicBytes { expected: Vec<u8>, got: Vec<u8> },
+    InvalidMagicBytes { expected: &'static [u8], got: [u8; 4] },
 
     #[error("invalid version: expected {expected}, got {got}")]
     InvalidVersion { expected: u8, got: u8 },
@@ -73,8 +73,8 @@ mod tests {
     #[test]
     fn display_invalid_magic() {
         let e = EoipError::InvalidMagicBytes {
-            expected: vec![0x20, 0x01, 0x64, 0x00],
-            got: vec![0x20, 0x01, 0x64, 0x01],
+            expected: &[0x20, 0x01, 0x64, 0x00],
+            got: [0x20, 0x01, 0x64, 0x01],
         };
         assert!(e.to_string().contains("[20, 01, 64, 01]"));
     }

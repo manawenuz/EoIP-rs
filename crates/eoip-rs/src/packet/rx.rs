@@ -157,10 +157,11 @@ fn pin_thread_to_cpu(cpu: Option<usize>) {
 static LAST_MISS_LOG: AtomicU64 = AtomicU64::new(0);
 static MISS_COUNT: AtomicU64 = AtomicU64::new(0);
 
+static START_INSTANT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 fn log_demux_miss(key: &DemuxKey) {
     let count = MISS_COUNT.fetch_add(1, Ordering::Relaxed);
-    let now = Instant::now();
-    let now_ms = now.elapsed().as_millis() as u64;
+    let now_ms = START_INSTANT.get_or_init(Instant::now).elapsed().as_millis() as u64;
     let last = LAST_MISS_LOG.load(Ordering::Relaxed);
     if now_ms.wrapping_sub(last) > 1000
         && LAST_MISS_LOG

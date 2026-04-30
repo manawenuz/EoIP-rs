@@ -18,7 +18,10 @@ use tokio_util::sync::CancellationToken;
 use eoip_proto::gre::{self, EOIP_HEADER_LEN};
 use eoip_proto::etherip::{self, ETHERIP_HEADER_LEN};
 
+#[cfg(target_os = "linux")]
 use crate::net::tap::TapDevice;
+#[cfg(target_os = "macos")]
+use crate::net::tap_macos::FethDevice as TapDevice;
 use crate::packet::buffer::{BufferPool, PacketBuf};
 use crate::tunnel::handle::TunnelHandle;
 
@@ -81,14 +84,17 @@ async fn read_and_encode(
     buf.set_len(n);
 
     // Update TX stats
-    handle.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
+    let tx_count = handle.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
     handle.stats.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    handle.stats.last_tx_timestamp.store(now_ms, Ordering::Relaxed);
+    // Update timestamp only every 64 packets to avoid syscall overhead
+    if tx_count % 64 == 0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        handle.stats.last_tx_timestamp.store(now_ms, Ordering::Relaxed);
+    }
 
     // Prepend protocol header into headroom
     if is_v6 {
@@ -200,6 +206,8 @@ fn flush_batch(raw_v4_fd: std::os::fd::RawFd, raw_v6_fd: std::os::fd::RawFd, bat
     batch.clear();
 }
 
+/// Linux: batch send via sendmmsg (one syscall for N packets).
+#[cfg(target_os = "linux")]
 fn send_batch(raw_fd: std::os::fd::RawFd, pkts: &[&TxPacket]) {
     let len = pkts.len();
 
@@ -260,6 +268,22 @@ fn send_batch(raw_fd: std::os::fd::RawFd, pkts: &[&TxPacket]) {
         match err.raw_os_error() {
             Some(libc::EAGAIN) | Some(libc::ENOBUFS) => {}
             _ => tracing::error!(%err, "TX sendmmsg failed"),
+        }
+    }
+}
+
+/// Non-Linux: per-packet sendto (no sendmmsg available).
+#[cfg(not(target_os = "linux"))]
+fn send_batch(raw_fd: std::os::fd::RawFd, pkts: &[&TxPacket]) {
+    for pkt in pkts {
+        let data = pkt.buf.as_slice();
+        let dest = nix::sys::socket::SockaddrStorage::from(pkt.dest);
+        if let Err(e) = nix::sys::socket::sendto(raw_fd, data, &dest, nix::sys::socket::MsgFlags::empty()) {
+            let err = io::Error::from(e);
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::ENOBUFS) => {}
+                _ => tracing::error!(%err, "TX sendto failed"),
+            }
         }
     }
 }

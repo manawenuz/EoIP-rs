@@ -85,8 +85,8 @@ pub fn decode_udp_shim(buf: &[u8]) -> Result<(u8, usize), EoipError> {
 
     if buf[0..2] != UDP_SHIM_MAGIC {
         return Err(EoipError::InvalidMagicBytes {
-            expected: UDP_SHIM_MAGIC.to_vec(),
-            got: buf[0..2].to_vec(),
+            expected: &UDP_SHIM_MAGIC,
+            got: [buf[0], buf[1], 0, 0],
         });
     }
 
