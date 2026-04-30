@@ -134,6 +134,9 @@ pub fn spawn_tx_batcher(
     tokio::spawn(async move {
         tracing::info!("TX batcher started");
         let mut batch: Vec<TxPacket> = Vec::with_capacity(high_water);
+        let mut v4_indices: Vec<usize> = Vec::with_capacity(high_water);
+        let mut v6_indices: Vec<usize> = Vec::with_capacity(high_water);
+        let mut bufs = TxBatchBuffers::with_capacity(high_water);
 
         loop {
             // Wait for at least one packet or shutdown
@@ -150,7 +153,7 @@ pub fn spawn_tx_batcher(
             // If queue has more packets, try to fill the batch
             if batch.len() < low_water {
                 // Immediate mode: send now for low latency
-                flush_batch(raw_v4_fd, raw_v6_fd, &mut batch);
+                flush_batch(raw_v4_fd, raw_v6_fd, &mut batch, &mut v4_indices, &mut v6_indices, &mut bufs);
                 continue;
             }
 
@@ -169,38 +172,72 @@ pub fn spawn_tx_batcher(
                 }
             }
 
-            flush_batch(raw_v4_fd, raw_v6_fd, &mut batch);
+            flush_batch(raw_v4_fd, raw_v6_fd, &mut batch, &mut v4_indices, &mut v6_indices, &mut bufs);
         }
 
         // Flush remaining
         if !batch.is_empty() {
-            flush_batch(raw_v4_fd, raw_v6_fd, &mut batch);
+            flush_batch(raw_v4_fd, raw_v6_fd, &mut batch, &mut v4_indices, &mut v6_indices, &mut bufs);
         }
 
         tracing::info!("TX batcher stopped");
     })
 }
 
-fn flush_batch(raw_v4_fd: std::os::fd::RawFd, raw_v6_fd: std::os::fd::RawFd, batch: &mut Vec<TxPacket>) {
+/// Reusable buffers for the TX batcher to avoid per-flush allocations.
+struct TxBatchBuffers {
+    iovecs: Vec<libc::iovec>,
+    addrs_v4: Vec<libc::sockaddr_in>,
+    addrs_v6: Vec<libc::sockaddr_in6>,
+    is_v6: Vec<bool>,
+    #[cfg(target_os = "linux")]
+    msgs: Vec<libc::mmsghdr>,
+}
+
+// Safe: all raw pointers in these libc structs are derived from owned Vec data
+// that lives within this same task. The buffers are never shared across threads.
+unsafe impl Send for TxBatchBuffers {}
+
+impl TxBatchBuffers {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            iovecs: Vec::with_capacity(cap),
+            addrs_v4: Vec::with_capacity(cap),
+            addrs_v6: Vec::with_capacity(cap),
+            is_v6: Vec::with_capacity(cap),
+            #[cfg(target_os = "linux")]
+            msgs: Vec::with_capacity(cap),
+        }
+    }
+}
+
+fn flush_batch(
+    raw_v4_fd: std::os::fd::RawFd,
+    raw_v6_fd: std::os::fd::RawFd,
+    batch: &mut Vec<TxPacket>,
+    v4_indices: &mut Vec<usize>,
+    v6_indices: &mut Vec<usize>,
+    bufs: &mut TxBatchBuffers,
+) {
     if batch.is_empty() {
         return;
     }
 
     // Split batch by protocol — sendmmsg requires all messages on the same fd
-    let mut v4_pkts: Vec<&TxPacket> = Vec::new();
-    let mut v6_pkts: Vec<&TxPacket> = Vec::new();
-    for pkt in batch.iter() {
+    v4_indices.clear();
+    v6_indices.clear();
+    for (i, pkt) in batch.iter().enumerate() {
         match pkt.dest {
-            SocketAddr::V4(_) => v4_pkts.push(pkt),
-            SocketAddr::V6(_) => v6_pkts.push(pkt),
+            SocketAddr::V4(_) => v4_indices.push(i),
+            SocketAddr::V6(_) => v6_indices.push(i),
         }
     }
 
-    if !v4_pkts.is_empty() {
-        send_batch(raw_v4_fd, &v4_pkts);
+    if !v4_indices.is_empty() {
+        send_batch(raw_v4_fd, batch, v4_indices, bufs);
     }
-    if !v6_pkts.is_empty() {
-        send_batch(raw_v6_fd, &v6_pkts);
+    if !v6_indices.is_empty() {
+        send_batch(raw_v6_fd, batch, v6_indices, bufs);
     }
 
     batch.clear();
@@ -208,59 +245,65 @@ fn flush_batch(raw_v4_fd: std::os::fd::RawFd, raw_v6_fd: std::os::fd::RawFd, bat
 
 /// Linux: batch send via sendmmsg (one syscall for N packets).
 #[cfg(target_os = "linux")]
-fn send_batch(raw_fd: std::os::fd::RawFd, pkts: &[&TxPacket]) {
-    let len = pkts.len();
+fn send_batch(
+    raw_fd: std::os::fd::RawFd,
+    batch: &Vec<TxPacket>,
+    indices: &[usize],
+    bufs: &mut TxBatchBuffers,
+) {
+    let len = indices.len();
 
-    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(len);
-    let mut addrs_v4: Vec<libc::sockaddr_in> = Vec::new();
-    let mut addrs_v6: Vec<libc::sockaddr_in6> = Vec::new();
-    let mut is_v6: Vec<bool> = Vec::with_capacity(len);
+    bufs.iovecs.clear();
+    bufs.addrs_v4.clear();
+    bufs.addrs_v6.clear();
+    bufs.is_v6.clear();
 
-    for pkt in pkts {
+    for &idx in indices {
+        let pkt = &batch[idx];
         let data = pkt.buf.as_slice();
-        iovecs.push(libc::iovec {
+        bufs.iovecs.push(libc::iovec {
             iov_base: data.as_ptr() as *mut libc::c_void,
             iov_len: data.len(),
         });
         match pkt.dest {
             SocketAddr::V4(v4) => {
-                is_v6.push(false);
+                bufs.is_v6.push(false);
                 let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
                 addr.sin_family = libc::AF_INET as libc::sa_family_t;
                 addr.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
-                addrs_v4.push(addr);
+                bufs.addrs_v4.push(addr);
             }
             SocketAddr::V6(v6) => {
-                is_v6.push(true);
+                bufs.is_v6.push(true);
                 let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
                 addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
                 addr.sin6_addr.s6_addr = v6.ip().octets();
-                addrs_v6.push(addr);
+                bufs.addrs_v6.push(addr);
             }
         }
     }
 
-    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(len);
+    bufs.msgs.clear();
     let mut v4_idx = 0usize;
     let mut v6_idx = 0usize;
-    for (i, v6) in is_v6.iter().enumerate() {
+    for (i, v6) in bufs.is_v6.iter().enumerate() {
         let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
-        hdr.msg_hdr.msg_iov = &mut iovecs[i];
+        hdr.msg_hdr.msg_iov = &mut bufs.iovecs[i];
         hdr.msg_hdr.msg_iovlen = 1;
         if *v6 {
-            hdr.msg_hdr.msg_name = &mut addrs_v6[v6_idx] as *mut _ as *mut libc::c_void;
+            hdr.msg_hdr.msg_name = &mut bufs.addrs_v6[v6_idx] as *mut _ as *mut libc::c_void;
             hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as u32;
             v6_idx += 1;
         } else {
-            hdr.msg_hdr.msg_name = &mut addrs_v4[v4_idx] as *mut _ as *mut libc::c_void;
+            hdr.msg_hdr.msg_name = &mut bufs.addrs_v4[v4_idx] as *mut _ as *mut libc::c_void;
             hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
             v4_idx += 1;
         }
-        msgs.push(hdr);
+        bufs.msgs.push(hdr);
     }
 
     let sent = unsafe {
-        libc::sendmmsg(raw_fd, msgs.as_mut_ptr(), msgs.len() as u32, 0)
+        libc::sendmmsg(raw_fd, bufs.msgs.as_mut_ptr(), bufs.msgs.len() as u32, 0)
     };
 
     if sent < 0 {
@@ -274,8 +317,14 @@ fn send_batch(raw_fd: std::os::fd::RawFd, pkts: &[&TxPacket]) {
 
 /// Non-Linux: per-packet sendto (no sendmmsg available).
 #[cfg(not(target_os = "linux"))]
-fn send_batch(raw_fd: std::os::fd::RawFd, pkts: &[&TxPacket]) {
-    for pkt in pkts {
+fn send_batch(
+    raw_fd: std::os::fd::RawFd,
+    batch: &Vec<TxPacket>,
+    indices: &[usize],
+    _bufs: &mut TxBatchBuffers,
+) {
+    for &idx in indices {
+        let pkt = &batch[idx];
         let data = pkt.buf.as_slice();
         let dest = nix::sys::socket::SockaddrStorage::from(pkt.dest);
         if let Err(e) = nix::sys::socket::sendto(raw_fd, data, &dest, nix::sys::socket::MsgFlags::empty()) {

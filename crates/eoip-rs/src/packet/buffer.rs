@@ -24,7 +24,7 @@ pub const BUF_TOTAL: usize = HEADER_HEADROOM + MAX_FRAME_SIZE;
 /// On TX: TAP read fills `data[head..head+len]`, then `prepend_header(n)`
 /// shifts `head` backward by `n` to include the protocol header.
 pub struct PacketBuf {
-    data: Box<[u8; BUF_TOTAL]>,
+    data: Option<Box<[u8; BUF_TOTAL]>>,
     /// Start of valid data within `data`.
     head: usize,
     /// Length of valid data from `head`.
@@ -37,7 +37,7 @@ impl PacketBuf {
     /// Create a new standalone buffer (not from a pool).
     pub fn new() -> Self {
         Self {
-            data: Box::new([0u8; BUF_TOTAL]),
+            data: Some(Box::new([0u8; BUF_TOTAL])),
             head: HEADER_HEADROOM,
             len: 0,
             pool: None,
@@ -46,7 +46,7 @@ impl PacketBuf {
 
     /// Get a mutable slice to the payload area (for reading from TAP/socket).
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        &mut self.data[HEADER_HEADROOM..HEADER_HEADROOM + MAX_FRAME_SIZE]
+        &mut self.data.as_mut().unwrap()[HEADER_HEADROOM..HEADER_HEADROOM + MAX_FRAME_SIZE]
     }
 
     /// Set the valid payload length after a read operation.
@@ -62,12 +62,12 @@ impl PacketBuf {
         debug_assert!(header_len <= self.head, "header exceeds headroom");
         self.head -= header_len;
         self.len += header_len;
-        &mut self.data[self.head..self.head + header_len]
+        &mut self.data.as_mut().unwrap()[self.head..self.head + header_len]
     }
 
     /// The complete valid data slice (header + payload).
     pub fn as_slice(&self) -> &[u8] {
-        &self.data[self.head..self.head + self.len]
+        &self.data.as_ref().unwrap()[self.head..self.head + self.len]
     }
 
     /// Length of valid data.
@@ -152,9 +152,9 @@ impl Drop for PacketBuf {
     fn drop(&mut self) {
         if let Some(pool) = self.pool.take() {
             self.reset();
-            // Detach from pool before returning to avoid recursive drop
+            // Move data out without allocating a replacement.
             let mut returned = PacketBuf {
-                data: std::mem::replace(&mut self.data, Box::new([0u8; BUF_TOTAL])),
+                data: self.data.take(),
                 head: HEADER_HEADROOM,
                 len: 0,
                 pool: None,
